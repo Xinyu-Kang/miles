@@ -116,9 +116,9 @@ class RayTrainGroup:
         """Save actor model"""
         return ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
 
-    def update_weights(self):
+    def update_weights(self, rollout_id: int | None = None):
         """Broadcast weights from rank 0 to all other ranks."""
-        return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        return ray.get([actor.update_weights.remote(rollout_id) for actor in self._actor_handlers])
 
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])
