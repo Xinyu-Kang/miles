@@ -1,22 +1,21 @@
 #### Use the base image for ROCm 7 / gfx942 (MI300)
 
 # =====================================================================
-# Docker Image Version Information (Updated: Feb 5, 2026)
+# Docker Image Version Information (Updated: Apr 3, 2026)
 # =====================================================================
 # Base image: ROCm 7 with vllm pre-built for gfx942
 # Target GPU: MI300 (gfx942)
 #
 # Key Dependencies:
-# - sglang: sglang-miles branch
+# - sglang: sglang-miles-v0.5.9 branch
 # - sgl_kernel: built from selected sglang commit
-# - Megatron-LM: radixark/Megatron-LM
-# - TransformerEngine: commit 90c04bcdc3c109505b318f40a39680263af55edf
-# - aiter: v0.1.10.post3
+# - Megatron-LM: radixark/Megatron-LM @ 038e8e5a2533ba9ce5d4d4ee0f42f17ad1758702
+# - TransformerEngine: commit 307b5e86bb5960e347f1f70224d17e09e73f5338
+# - aiter: v0.1.11.post1
 # - Ray: 2.47.1
 #
-# Patches: amd_patch/sglv0.5.7/
+# Patches: amd_patch/latest/
 # - megatron.patch
-# - sglang.patch
 # =====================================================================
 
 
@@ -26,11 +25,12 @@ SHELL ["/bin/bash", "-ceuxo", "pipefail"]
 
 ARG MAX_JOBS=128
 ARG SGLANG_REPO=sgl-project/sglang
-ARG SGLANG_BRANCH=sglang-miles
+ARG SGLANG_BRANCH=sglang-miles-v0.5.9
 ARG SGLANG_COMMIT=""
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
-ARG MEGATRON_COMMIT=""
+ARG MEGATRON_COMMIT=038e8e5a2533ba9ce5d4d4ee0f42f17ad1758702
+ARG TRANSFORMER_ENGINE_COMMIT=307b5e86bb5960e347f1f70224d17e09e73f5338
 ENV MAX_JOBS=${MAX_JOBS}
 
 # Set environment variables for gfx942
@@ -49,10 +49,7 @@ RUN pip uninstall -y aiter || true
 RUN rm -rf aiter
 RUN git clone https://github.com/ROCm/aiter.git \
     && cd aiter \
-    && git checkout v0.1.10.post3 \
-    && curl -fsSL https://patch-diff.githubusercontent.com/raw/ROCm/aiter/pull/2075.patch -o /tmp/aiter-pr2075.patch \
-    && git apply --3way /tmp/aiter-pr2075.patch \
-    && rm -f /tmp/aiter-pr2075.patch \
+    && git checkout v0.1.11.post1 \
     && git submodule sync --recursive \
     && git submodule update --init --recursive \
     && GPU_ARCHS=gfx942 python setup.py develop
@@ -69,16 +66,17 @@ WORKDIR /app
 RUN rm -rf TransformerEngine
 RUN git clone https://github.com/ROCm/TransformerEngine.git \
     && cd TransformerEngine \
-    && git checkout 90c04bcdc3c109505b318f40a39680263af55edf \
+    && git checkout ${TRANSFORMER_ENGINE_COMMIT} \
     && git submodule update --init --recursive
 
 ENV NVTE_FRAMEWORK=pytorch
 ENV NVTE_ROCM_ARCH=gfx942
 ENV NVTE_USE_HIPBLASLT=1
 ENV NVTE_USE_ROCM=1
+ENV NVTE_AITER_PREBUILT_BASE_URL=https://compute-artifactory.amd.com:5000/artifactory/rocm-generic-local/te-ci/aiter-prebuilts
 ENV CMAKE_PREFIX_PATH="/opt/rocm:/opt/rocm/hip:/usr/local:/usr"
 
-RUN cd TransformerEngine && pip install . -v
+RUN cd TransformerEngine && pip install --no-build-isolation . -v
 ###########################################
 ###########################################
 ###########################################
@@ -230,8 +228,7 @@ RUN python -m pip cache purge
 ###########################################
 
 # Copy patch from miles repo
-COPY amd_patch/sglv0.5.7/megatron.patch /app/patch/megatron.patch
-COPY amd_patch/sglv0.5.7/sglang.patch /app/patch/sglang.patch
+COPY amd_patch/latest/megatron.patch /app/patch/megatron.patch
 
 # Apply Megatron patches
 RUN cd /app/Megatron-LM \
@@ -241,14 +238,6 @@ RUN cd /app/Megatron-LM \
         exit 1; \
     fi \
     && pip install -e . -v
-
-# Apply SGLang patch
-RUN cd /app/sglang \
-    && git apply --3way /app/patch/sglang.patch \
-    && if grep -R -n '^<<<<<<< ' .; then \
-        echo "SGLang patch failed to apply cleanly. Please resolve conflicts." && \
-        exit 1; \
-    fi
 
 # Copy MOE configs for gfx942/MI300
 RUN find /app/sglang/python/sglang/srt/layers/quantization/configs/ \

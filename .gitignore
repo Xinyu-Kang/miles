@@ -193,3 +193,6 @@ _examples_synced/
 .env
 .DS_Store
 .claude/
+
+# Slurm logs
+scripts/multinode/logs
