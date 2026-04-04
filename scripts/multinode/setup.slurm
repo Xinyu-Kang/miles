@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-WORKSPACE=<your-path>/miles-multinode
+WORKSPACE="${WORKSPACE:-/home/xkang/miles-multinode}"
 IMAGE=rlsys/miles:rocm7-mi300-sglang0.5.9-te2.10.0-dev-307b5e86
 CONTAINER=miles-multinode
 
