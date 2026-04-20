@@ -1,3 +1,4 @@
+import os
 import socket
 import time
 from argparse import Namespace
@@ -15,6 +16,38 @@ from miles.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
+
+
+_FALSE_ENV_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+
+def _env_var_enabled(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _should_restore_rollout_weights_before_load(
+    quantization_config: dict[str, int | str | list[str]] | None,
+) -> bool:
+    if not quantization_config:
+        return False
+    return quantization_config["quant_method"] in {"compressed-tensors"}
+
+
+def _should_post_process_rollout_weights_after_load(
+    args: Namespace,
+    quantization_config: dict[str, int | str | list[str]] | None,
+) -> bool:
+    if quantization_config:
+        return quantization_config["quant_method"] in {"compressed-tensors", "mxfp8"}
+
+    # ROCm+AITER MoE also mutates rollout-side expert weights after load.
+    return (
+        getattr(args, "num_experts", None) not in (None, 0)
+        and torch.version.hip is not None
+        and _env_var_enabled("SGLANG_USE_AITER")
+        and getattr(args, "sglang_moe_runner_backend", "auto") == "auto"
+    )
 
 
 class UpdateWeightFromDistributed:
@@ -42,6 +75,10 @@ class UpdateWeightFromDistributed:
         self.quantization_config = quantization_config
         self.weight_version = 0
         self._model_update_groups = None
+        self._restore_rollout_weights_before_load = _should_restore_rollout_weights_before_load(quantization_config)
+        self._post_process_rollout_weights_after_load = _should_post_process_rollout_weights_after_load(
+            args, quantization_config
+        )
 
     def connect_rollout_engines(
         self,
@@ -87,8 +124,7 @@ class UpdateWeightFromDistributed:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
-            # int4/fp4 pre_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if self._restore_rollout_weights_before_load:
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
@@ -127,11 +163,7 @@ class UpdateWeightFromDistributed:
 
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
-            # int4/fp4 post_process, mxfp8 post-process (swizzle MoE scales).
-            if self.quantization_config and self.quantization_config["quant_method"] in [
-                "compressed-tensors",
-                "mxfp8",
-            ]:
+            if self._post_process_rollout_weights_after_load:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
@@ -341,7 +373,7 @@ def post_process_weights(
     rollout_engines: Sequence[ActorHandle],
 ):
     """
-    Trigger post-process for int4/fp4 quantization on all rollout engines.
+    Trigger rollout-side post-load processing after a weight update.
     """
     ray.get(
         [
