@@ -108,32 +108,65 @@ def _get_megatron_full_params(
     return gathered_params
 
 
+_SGLANG_FUSION_PAIR_SUFFIXES = [
+    (".self_attention.wq_a.weight", ".self_attention.wkv.weight"),
+    (".self_attention.compressor.wkv.weight", ".self_attention.compressor.wgate.weight"),
+    (".self_attention.indexer.compressor.wkv.weight", ".self_attention.indexer.compressor.wgate.weight"),
+]
+
+
+def _sglang_fusion_pair_key(name: str) -> str | None:
+    for first_suffix, second_suffix in _SGLANG_FUSION_PAIR_SUFFIXES:
+        if name.endswith(first_suffix):
+            return name[: -len(first_suffix)] + first_suffix
+        if name.endswith(second_suffix):
+            return name[: -len(second_suffix)] + first_suffix
+    return None
+
+
 def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torch.nn.Module]) -> list[list[ParamInfo]]:
     """
     Partition params into buckets ≤ update_weight_buffer_size (with TP replication).
     """
     param_infos = _get_megatron_local_param_infos(args, model)
-    param_info_buckets = [[]]  # Start with one empty bucket
+    param_info_buckets = [[]]
     buffer_size = 0  # Track current bucket size in bytes
 
-    for info in param_infos:
+    def _full_size(info: ParamInfo) -> int:
         # Expert params use expert-TP size, others use regular-TP size
         if ".experts." in info.name:
             tp_size = get_parallel_state().etp.size
         else:
             tp_size = get_parallel_state().tp.size
+        return info.size * tp_size
 
-        # Full param size = shard size × TP replicas (all-gather will reconstruct full param)
-        param_size = info.size * tp_size
+    def _commit(items: list[ParamInfo], items_size: int):
+        nonlocal buffer_size
 
-        # If adding this param exceeds limit AND current bucket has params: start new bucket
-        if buffer_size + param_size > args.update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
+        if buffer_size + items_size > args.update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
             param_info_buckets.append([])
             buffer_size = 0
+        param_info_buckets[-1].extend(items)
+        buffer_size += items_size
 
-        # Add param to current bucket and update size
-        param_info_buckets[-1].append(info)
-        buffer_size += param_size
+    pending_pairs: dict[str, tuple[list[ParamInfo], int]] = {}
+    for info in param_infos:
+        param_size = _full_size(info)
+        pair_key = _sglang_fusion_pair_key(info.name)
+        if pair_key is None:
+            _commit([info], param_size)
+            continue
+
+        items, items_size = pending_pairs.pop(pair_key, ([], 0))
+        items.append(info)
+        items_size += param_size
+        if len(items) == 2:
+            _commit(items, items_size)
+        else:
+            pending_pairs[pair_key] = (items, items_size)
+
+    for items, items_size in pending_pairs.values():
+        _commit(items, items_size)
 
     return param_info_buckets
 

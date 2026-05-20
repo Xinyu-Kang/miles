@@ -29,6 +29,10 @@ def _gather_with_stride(
     return torch.cat(interleaved, dim=partition_dim)
 
 
+def _force_tp_gather(name: str) -> bool:
+    return name.endswith(".self_attention.attn_sink")
+
+
 def _check_and_fix_partition(args: Namespace, name: str, partition_stride: int, partition_dim: int) -> tuple[int, int]:
     """Validate partition_stride values for known parameter patterns.
 
@@ -56,7 +60,10 @@ def all_gather_param(args: Namespace, name: str, param: torch.nn.Parameter) -> t
         return param
 
     assert hasattr(param, "tensor_model_parallel"), f"{name} does not have tensor_model_parallel attribute"
-    if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
+    force_tp_gather = _force_tp_gather(name)
+    if not force_tp_gather and (
+        not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated"
+    ):
         return param.data
 
     if ".experts." in name:
@@ -68,8 +75,8 @@ def all_gather_param(args: Namespace, name: str, param: torch.nn.Parameter) -> t
 
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
-    partition_dim = param.partition_dim
-    partition_stride = param.partition_stride
+    partition_dim = 0 if force_tp_gather else param.partition_dim
+    partition_stride = 1 if force_tp_gather else param.partition_stride
 
     partition_stride, partition_dim = _check_and_fix_partition(args, name, partition_stride, partition_dim)
     param = _gather_with_stride(param_partitions, partition_dim, partition_stride)
@@ -90,11 +97,14 @@ def all_gather_params_async(
     handles = []
 
     for info, param in param_infos_and_params:
+        force_tp_gather = _force_tp_gather(info.name)
         # Prepare async all_gather
         if "expert_bias" in info.name:
             gather_tasks.append((info, param, None, None, None, None))
             handles.append(None)
-        elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
+        elif not force_tp_gather and (
+            not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated"
+        ):
             gather_tasks.append((info, param.data, None, None, None, None))
             handles.append(None)
         else:
@@ -108,7 +118,9 @@ def all_gather_params_async(
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
             handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim, param.partition_stride))
+            partition_dim = 0 if force_tp_gather else param.partition_dim
+            partition_stride = 1 if force_tp_gather else param.partition_stride
+            gather_tasks.append((info, None, handle, param_partitions, partition_dim, partition_stride))
             handles.append(handle)
 
     # Phase 2: Wait for ALL async operations to complete at once
@@ -223,6 +235,21 @@ def _named_params_and_buffers_global(
                 expert_idx = int(expert_idx) + expert_offset
                 yield f"module.module.mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.weight{expert_idx}", param
                 continue
+
+            duplicated = [
+                "indexer.linear_weights_proj",
+                "indexer.linear_wk",
+                "indexer.linear_wq_b",
+                "linear_q_down_proj",
+                "linear_kv_down_proj",
+            ]
+            if any(dup in name for dup in duplicated):
+                param.parallel_mode = "duplicated"
+
+            if "attn_sink" in name:
+                param.tensor_model_parallel = True
+                param.partition_dim = 0
+                param.partition_stride = 1
 
             layer_idx, rest = match.groups()
             layer_idx = int(layer_idx) + layer_offset

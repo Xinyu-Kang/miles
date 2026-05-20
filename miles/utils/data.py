@@ -165,6 +165,41 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
     return prompt
 
 
+def _read_tokenizer_config(tokenizer) -> dict:
+    config_path = os.path.join(getattr(tokenizer, "name_or_path", ""), "config.json")
+    if not os.path.isfile(config_path):
+        return {}
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.warning("Failed to read tokenizer config from %s", config_path, exc_info=True)
+        return {}
+
+
+def _sglang_deepseek_encode_messages(tokenizer, messages, apply_chat_template_kwargs: dict | None) -> str:
+    config = _read_tokenizer_config(tokenizer)
+    if config.get("hc_mult") is not None or config.get("compress_ratios") is not None:
+        from sglang.srt.entrypoints.openai.encoding_dsv4 import encode_messages
+    elif config.get("index_n_heads") is not None or str(config.get("model_type", "")).startswith("deepseek"):
+        from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
+    else:
+        raise ValueError("No SGLang DeepSeek chat encoder matches this tokenizer config")
+
+    encode_config = {
+        "thinking_mode": "thinking",
+        "drop_thinking": True,
+        "add_default_bos_token": True,
+    }
+    if apply_chat_template_kwargs:
+        if "thinking" in apply_chat_template_kwargs:
+            encode_config["thinking_mode"] = "thinking" if apply_chat_template_kwargs["thinking"] else "chat"
+        for key in ("thinking_mode", "drop_thinking", "add_default_bos_token", "context", "reasoning_effort"):
+            if key in apply_chat_template_kwargs:
+                encode_config[key] = apply_chat_template_kwargs[key]
+    return encode_messages(messages, **encode_config)
+
+
 class Dataset:
     def __init__(
         self,
@@ -200,13 +235,18 @@ class Dataset:
                 metadata["tools"] = tools
 
             if apply_chat_template:
-                output_prompt = tokenizer.apply_chat_template(
-                    prompt,
-                    tools=tools,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    **(apply_chat_template_kwargs or {}),
-                )
+                try:
+                    output_prompt = tokenizer.apply_chat_template(
+                        prompt,
+                        tools=tools,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        **(apply_chat_template_kwargs or {}),
+                    )
+                except ValueError as e:
+                    if "chat template" not in str(e).lower():
+                        raise
+                    output_prompt = _sglang_deepseek_encode_messages(tokenizer, prompt, apply_chat_template_kwargs)
             else:
                 output_prompt = prompt
 

@@ -1,8 +1,10 @@
 import logging
 import os
 import re
+from contextlib import nullcontext
 from pathlib import Path
 
+import torch
 import torch.distributed as dist
 
 # TODO: may need to copy those 2 functions and do refactoring.
@@ -172,6 +174,9 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
 
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
+    if getattr(args, "load_hf_with_mbridge", False):
+        return _load_checkpoint_hf_with_mbridge(ddp_model, optimizer, args, load_path)
+
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
 
@@ -191,6 +196,89 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     iteration = 0
     num_floating_point_operations_so_far = 0
     return iteration, num_floating_point_operations_so_far
+
+
+def _load_checkpoint_hf_with_mbridge(ddp_model, optimizer, args, load_path: str):
+    from megatron.core.utils import unwrap_model
+    from mbridge import AutoBridge
+    from mbridge.core.bridge import Bridge
+
+    import miles_plugins.mbridge  # noqa: F401
+    from miles.utils.rocm_distributed import patch_rocm_scatter_with_broadcast
+    from miles.utils.transformers_patch import with_transformers_patch
+
+    patch_rocm_scatter_with_broadcast()
+
+    def current_device_name() -> str:
+        if torch.cuda.is_available():
+            return f"cuda:{torch.cuda.current_device()}"
+        return "cpu"
+
+    import mbridge.utils.device as device_module
+
+    original_device_fn = device_module.get_device_name
+    device_module.get_device_name = current_device_name
+    dequant_io_module = None
+    original_dequant_device_fn = None
+    try:
+        import mbridge.models.ext.deepseek_v3.dequant_fp8_safetensor_io as dequant_io_module
+
+        original_dequant_device_fn = dequant_io_module.get_device_name
+        dequant_io_module.get_device_name = current_device_name
+    except ImportError:
+        pass
+
+    original_method = Bridge._weight_to_mcore_format
+
+    def patched_method(self, mcore_weights_name, hf_weights):
+        original_dtype = getattr(self, "dtype", None)
+        self.dtype = None
+        try:
+            return original_method(self, mcore_weights_name, hf_weights)
+        finally:
+            self.dtype = original_dtype
+
+    Bridge._weight_to_mcore_format = patched_method
+
+    load_context = nullcontext()
+    if getattr(args, "offload_train", False):
+        try:
+            from torch_memory_saver import torch_memory_saver
+
+            torch_memory_saver._ensure_initialized()
+            cdll = torch_memory_saver._impl._binary_wrapper.cdll
+            if cdll.tms_get_interesting_region():
+                load_context = torch_memory_saver.disable()
+        except Exception:
+            logger.warning("torch_memory_saver disable failed during mbridge load", exc_info=True)
+
+    bridge_kwargs = {"trust_remote_code": True}
+    vocab_divisor = getattr(args, "make_vocab_size_divisible_by", None)
+    if vocab_divisor is not None:
+        bridge_kwargs["make_vocab_size_divisible_by"] = vocab_divisor
+
+    logger.info(f"Load checkpoint from HuggingFace model into Megatron with mbridge (path={load_path})")
+    try:
+        with with_transformers_patch():
+            bridge = AutoBridge.from_pretrained(args.hf_checkpoint, **bridge_kwargs)
+            hf_vocab_size = getattr(bridge.hf_config, "vocab_size", None)
+            padded_vocab_size = getattr(args, "padded_vocab_size", None)
+            if hf_vocab_size is not None and padded_vocab_size is not None:
+                bridge.vocab_size = hf_vocab_size
+                bridge.padded_vocab_size = padded_vocab_size
+            with load_context:
+                bridge.load_weights(unwrap_model(ddp_model), load_path, memory_efficient=False)
+    finally:
+        Bridge._weight_to_mcore_format = original_method
+        device_module.get_device_name = original_device_fn
+        if dequant_io_module is not None and original_dequant_device_fn is not None:
+            dequant_io_module.get_device_name = original_dequant_device_fn
+
+    if (args.fp16 or args.bf16) and optimizer is not None:
+        assert not args.load_main_params_from_ckpt
+        optimizer.reload_model_params()
+
+    return 0, 0
 
 
 def _is_dir_nonempty(path):

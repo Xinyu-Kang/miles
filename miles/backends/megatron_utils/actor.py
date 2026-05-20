@@ -9,7 +9,6 @@ import torch
 import torch.distributed as dist
 from ray.actor import ActorHandle
 from torch_memory_saver import torch_memory_saver
-from transformers import AutoConfig
 
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import train_dump_utils
@@ -22,6 +21,7 @@ from miles.utils.reloadable_process_group import destroy_process_groups, monkey_
 from miles.utils.replay_base import all_replay_managers
 from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.tracking_utils import init_tracking
+from miles.utils.transformers_patch import load_hf_config
 from miles.utils.types import RolloutBatch
 
 from ...utils.profile_utils import TrainProfiler
@@ -39,7 +39,6 @@ from .parallel import verify_megatron_parallel_state
 from .replay_utils import get_register_replay_list_func
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
-from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
@@ -81,7 +80,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(dist.get_world_size()):
             if i == dist.get_rank():
-                self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+                self.hf_config = load_hf_config(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = load_tokenizer(
                     self.args.hf_checkpoint, chat_template_path=self.args.chat_template_path, trust_remote_code=True
                 )
@@ -164,6 +163,8 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.update_weight_transfer_mode == "broadcast":
                 update_weight_cls = UpdateWeightFromDistributed
             else:
+                from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
+
                 update_weight_cls = UpdateWeightP2P
         self.weight_updater = update_weight_cls(
             self.args,
@@ -511,7 +512,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             reload_process_groups()
 
-        if num_new_engines > 0:
+        needs_weight_updater_connect = num_new_engines > 0 or not hasattr(self.weight_updater, "rollout_engines")
+
+        if needs_weight_updater_connect and rollout_engines:
             self.weight_updater.connect_rollout_engines(
                 rollout_engines,
                 rollout_engine_lock,

@@ -1,0 +1,211 @@
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1506,6 +1506,18 @@
+ 
+ 
+ @dataclass
++class PostProcessWeightsReqInput(BaseReq):
++    restore_weights_before_load: bool = False
++    post_process_quantization: bool = False
++
++
++@dataclass
++class PostProcessWeightsReqOutput(BaseReq):
++    success: bool
++    message: str
++
++
++@dataclass
+ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
+     success: bool
+     message: str
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -58,6 +58,8 @@
+     ProfileReq,
+     ProfileReqOutput,
+     ProfileReqType,
++    PostProcessWeightsReqInput,
++    PostProcessWeightsReqOutput,
+     ReleaseMemoryOccupationReqInput,
+     ReleaseMemoryOccupationReqOutput,
+     RemoveExternalCorpusReqInput,
+@@ -102,6 +104,7 @@
+     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
+     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
++    ("post_process_weights", PostProcessWeightsReqOutput),
+     ("get_weights_by_name", GetWeightsByNameReqOutput),
+     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
+     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
+@@ -496,6 +499,16 @@
+ 
+         return success, message
+ 
++    async def post_process_weights(
++        self: TokenizerManager,
++        obj: PostProcessWeightsReqInput,
++        request: Optional[fastapi.Request] = None,
++    ) -> Tuple[bool, str]:
++        self.auto_create_handle_loop()
++        async with self.model_update_lock.writer_lock:
++            results = await self.post_process_weights_communicator(obj)
++        return FanOutCommunicator.merge_results(results)
++
+     async def update_weights_from_ipc(
+         self: TokenizerManager,
+         obj: UpdateWeightsFromIPCReqInput,
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -29,6 +29,7 @@
+     InitWeightsUpdateGroupReqInput,
+     LoadLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterReqInput,
++    PostProcessWeightsReqInput,
+     SendWeightsToRemoteInstanceReqInput,
+     UnloadLoRAAdapterReqInput,
+     UpdateWeightFromDiskReqInput,
+@@ -170,6 +171,10 @@
+         success, message = self.model_runner.update_weights_from_ipc(recv_req)
+         return success, message
+ 
++    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
++        success, message = self.model_runner.post_process_weights(recv_req)
++        return success, message
++
+     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+         parameter = self.model_runner.get_weights_by_name(
+             recv_req.name, recv_req.truncate_size
+--- a/python/sglang/srt/managers/scheduler_update_weights_mixin.py
++++ b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+@@ -21,6 +21,8 @@
+     GetWeightsByNameReqOutput,
+     InitWeightsUpdateGroupReqInput,
+     InitWeightsUpdateGroupReqOutput,
++    PostProcessWeightsReqInput,
++    PostProcessWeightsReqOutput,
+     ReleaseMemoryOccupationReqInput,
+     ReleaseMemoryOccupationReqOutput,
+     ResumeMemoryOccupationReqInput,
+@@ -111,6 +113,10 @@
+         torch.distributed.barrier(group=self.tp_cpu_group)
+         return UpdateWeightsFromTensorReqOutput(success, message)
+ 
++    def post_process_weights(self: Scheduler, recv_req: PostProcessWeightsReqInput):
++        success, message = self.tp_worker.post_process_weights(recv_req)
++        return PostProcessWeightsReqOutput(success=success, message=message)
++
+     def update_weights_from_ipc(
+         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
+     ):
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -124,6 +124,7 @@
+     LoadLoRAAdapterReqOutput,
+     OpenSessionReqInput,
+     PauseGenerationReqInput,
++    PostProcessWeightsReqInput,
+     ProfileReq,
+     ReleaseMemoryOccupationReqInput,
+     RemoveExternalCorpusReqInput,
+@@ -1436,6 +1437,7 @@
+                 ),
+                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
+                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
++                (PostProcessWeightsReqInput, self.post_process_weights),
+                 (GetWeightsByNameReqInput, self.get_weights_by_name),
+                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
+                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -3486,6 +3486,31 @@
+     def check_weights(self, action: str):
+         return self._weight_checker.handle(action=action)
+ 
++    def post_process_weights(self, recv_req):
++        from sglang.srt.model_loader.loader import device_loading_context
++
++        target_device = torch.device("cuda", torch.cuda.current_device())
++
++        if recv_req.restore_weights_before_load:
++            for _, module in self.model.named_modules():
++                quant_method = getattr(module, "quant_method", None)
++                if quant_method is not None and hasattr(
++                    quant_method, "restore_weights_before_loading"
++                ):
++                    with device_loading_context(module, target_device):
++                        quant_method.restore_weights_before_loading(module)
++
++        if recv_req.post_process_quantization:
++            for _, module in self.model.named_modules():
++                quant_method = getattr(module, "quant_method", None)
++                if quant_method is not None and hasattr(
++                    quant_method, "process_weights_after_loading"
++                ):
++                    with device_loading_context(module, target_device):
++                        quant_method.process_weights_after_loading(module)
++
++        return True, "Success"
++
+     def update_weights_from_ipc(self, recv_req):
+         """Update weights from IPC for checkpoint-engine integration."""
+         try:
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -127,6 +127,7 @@
+     OpenSessionReqInput,
+     ParseFunctionCallReq,
+     PauseGenerationReqInput,
++    PostProcessWeightsReqInput,
+     ProfileReqInput,
+     ReleaseMemoryOccupationReqInput,
+     ResumeMemoryOccupationReqInput,
+@@ -1206,6 +1207,18 @@
+         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+ 
+ 
++@app.post("/post_process_weights")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def post_process_weights(req: PostProcessWeightsReqInput, request: Request):
++    success, message = await _global_state.tokenizer_manager.post_process_weights(
++        req, request
++    )
++    content = {"success": success, "message": message}
++    return ORJSONResponse(
++        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
++
++
+ @app.post("/update_weights_from_ipc")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -70,6 +70,7 @@
+     LoadLoRAAdapterReqInput,
+     MultimodalDataInputFormat,
+     OpenSessionReqInput,
++    PostProcessWeightsReqInput,
+     ReleaseMemoryOccupationReqInput,
+     ResumeMemoryOccupationReqInput,
+     RpcReqInput,
+@@ -991,6 +992,19 @@
+             self.tokenizer_manager.update_weights_from_tensor(obj, None)
+         )
+ 
++    def post_process_weights(
++        self,
++        restore_weights_before_load: bool = False,
++        post_process_quantization: bool = False,
++    ):
++        obj = PostProcessWeightsReqInput(
++            restore_weights_before_load=restore_weights_before_load,
++            post_process_quantization=post_process_quantization,
++        )
++        return self.loop.run_until_complete(
++            self.tokenizer_manager.post_process_weights(obj, None)
++        )
++
+     def update_weights_from_disk(
+         self,
+         model_path: str,

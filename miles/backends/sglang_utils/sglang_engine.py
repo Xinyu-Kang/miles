@@ -253,8 +253,11 @@ class SGLangEngine(RayActor):
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
-            e.add_note(f"{response.text=}")
-            raise
+            raise requests.exceptions.HTTPError(
+                f"{e}; response.text={response.text!r}",
+                response=response,
+                request=response.request,
+            ) from e
         return response.json()
 
     def health_generate(self, timeout: float = 5.0) -> bool:

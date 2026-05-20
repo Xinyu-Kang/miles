@@ -6,7 +6,6 @@ from typing import Any
 
 import yaml
 from sglang_router.launch_router import RouterArgs
-from transformers import AutoConfig
 
 from miles.backends.sglang_utils.arguments import add_sglang_arguments
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
@@ -15,6 +14,7 @@ from miles.utils.environ import enable_experimental_rollout_refactor
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import load_function
+from miles.utils.transformers_patch import load_hf_config
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +201,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 choices=["raw", "bridge"],
                 default="raw",
                 help="The method to convert megatron weights to hugging face weights for SGLang.",
+            )
+            parser.add_argument(
+                "--load-hf-with-mbridge",
+                action="store_true",
+                default=False,
+                help="Load a HuggingFace checkpoint into Megatron with the mbridge package.",
             )
             parser.add_argument(
                 "--extra-high-precision-layers-hf",
@@ -1779,7 +1785,7 @@ def parse_args(add_custom_arguments=None):
 
         args = megatron_parse_args(extra_args_provider=add_miles_arguments)
         if args.hf_checkpoint:
-            hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+            hf_config = load_hf_config(args.hf_checkpoint, trust_remote_code=True)
             hf_validate_args(args, hf_config)
 
         args.rank = 0
@@ -2272,7 +2278,11 @@ def hf_validate_args(args, hf_config):
         ("hidden_size", "hidden_size", equal),
         ("num_attention_heads", "num_attention_heads", equal),
         ("num_hidden_layers", "num_layers", equal),
-        ("intermediate_size", "ffn_hidden_size", equal),
+        (
+            "moe_intermediate_size" if hasattr(hf_config, "moe_intermediate_size") else "intermediate_size",
+            "ffn_hidden_size",
+            equal,
+        ),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
         (
             "rms_norm_eps",

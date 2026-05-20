@@ -1,0 +1,140 @@
+# DSv4 MI355X base: ROCm 7.2 DSv4 stack
+ARG SGLANG_IMAGE_TAG=rocm720-mi35x-b19052c-20260519-DSv4
+FROM rocm/sgl-dev:${SGLANG_IMAGE_TAG} AS sglang
+
+SHELL ["/bin/bash", "-ceuxo", "pipefail"]
+
+# ======================================== Arguments =============================================
+
+ARG MEGATRON_REPO=radixark/Megatron-LM
+ARG MEGATRON_BASE_BRANCH=miles-main
+ARG MEGATRON_PR=28
+# Megatron DSv4: radixark/Megatron-LM pull/28
+ARG MEGATRON_COMMIT=1c6e5b7bcde0097ebe193b6258115ff3558f69d6
+
+ARG GPU_ARCH=gfx950
+ARG MAX_JOBS=128
+
+# mbridge: direct HF FP8 -> Megatron
+ARG MBRIDGE_COMMIT=1ecf526e637b813f162d97c212ed264c94c1db3d
+
+ARG TORCH_MEMORY_SAVER_REPO=https://github.com/zyzshishui/torch_memory_saver.git
+ARG TORCH_MEMORY_SAVER_COMMIT=58631d96d6d75637ca071d09928d53dad2b2d82f
+
+ARG TRANSFORMER_ENGINE_REPO=https://github.com/ROCm/TransformerEngine.git
+# TE: 2.12.0.dev0+86438dc
+ARG TRANSFORMER_ENGINE_COMMIT=86438dc3d04e7726a2f8f7dc2bcbe74e2bc1f282
+
+ARG RCCL_TESTS_REPO=https://github.com/ROCm/rocm-systems.git
+ARG RCCL_TESTS_BRANCH=develop
+ARG RCCL_TESTS_PATH=projects/rccl-tests
+
+# ======================================== Setup =============================================
+
+WORKDIR /root/
+
+ENV MAX_JOBS=${MAX_JOBS}
+
+# MI350 / MI355 gfx950 build config
+ENV GPU_ARCH=${GPU_ARCH}
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
+ENV GPU_ARCH_LIST=${GPU_ARCH}
+ENV AMDGPU_TARGET=${GPU_ARCH}
+
+ENV NVTE_FRAMEWORK=pytorch
+ENV NVTE_ROCM_ARCH=${GPU_ARCH}
+ENV NVTE_USE_HIPBLASLT=1
+ENV NVTE_USE_ROCM=1
+ENV CMAKE_PREFIX_PATH=/opt/rocm:/opt/rocm/hip:/usr/local:/usr
+
+# Local patches
+# - megatron.patch: ROCm fused-kernel/toolchain compat
+# - sglang_post_process_weights.patch: Megatron BF16 -> SGLang FP8 post-update hook
+COPY docker/amd_patch/latest/megatron.patch /tmp/amd_patch/megatron.patch
+COPY docker/amd_patch/latest/sglang_post_process_weights.patch /tmp/amd_patch/sglang_post_process_weights.patch
+COPY requirements.txt /tmp/requirements.txt
+
+# ======================================== Apt dependencies =============================================
+
+RUN apt update
+# Build tools / MI355X diagnostics
+RUN apt install -y build-essential cmake dnsutils ethtool git nvtop rsync
+
+# rccl-tests diagnostics
+RUN git clone --depth 1 --branch ${RCCL_TESTS_BRANCH} ${RCCL_TESTS_REPO} /tmp/rocm-systems && \
+    make -C /tmp/rocm-systems/${RCCL_TESTS_PATH} -j$(nproc) \
+      HIP_HOME=/opt/rocm \
+      NCCL_HOME=/opt/rocm \
+      GPU_TARGETS=${GPU_ARCH} && \
+    cp /tmp/rocm-systems/${RCCL_TESTS_PATH}/build/*_perf /usr/local/bin/ && \
+    rm -rf /tmp/rocm-systems
+
+# ====================================== Python dependencies ============================================
+
+# SGLang: DSv4 base + local post-process patch only
+RUN cd /sgl-workspace/sglang && git apply /tmp/amd_patch/sglang_post_process_weights.patch
+RUN python -c "import sglang, sgl_kernel, aiter; print('DSv4 SGLang base imports: OK')"
+
+# TE build: Megatron-side package
+RUN pip uninstall -y transformer-engine transformer_engine transformer_engine_torch || true
+RUN rm -rf /root/TransformerEngine && \
+    git clone --recursive ${TRANSFORMER_ENGINE_REPO} /root/TransformerEngine && \
+    cd /root/TransformerEngine && \
+    git checkout ${TRANSFORMER_ENGINE_COMMIT} && \
+    git submodule sync --recursive && \
+    git submodule update --init --recursive && \
+    NVTE_FUSED_ATTN=0 pip install . --no-build-isolation -v
+
+# mbridge: direct HF FP8 load path
+RUN pip install git+https://github.com/ISEEKYAN/mbridge.git@${MBRIDGE_COMMIT} --no-deps
+
+# Megatron: PR 28 on miles-main
+# Megatron patch: fused-kernel + TE 2.12 workspace kwarg
+RUN rm -rf /root/Megatron-LM && \
+    git clone -b ${MEGATRON_BASE_BRANCH} https://github.com/${MEGATRON_REPO}.git /root/Megatron-LM && \
+    cd /root/Megatron-LM && \
+    git fetch origin pull/${MEGATRON_PR}/head:pr-${MEGATRON_PR}-deepseek-v4 && \
+    git checkout ${MEGATRON_COMMIT} && \
+    git submodule sync --recursive && \
+    git submodule update --init --recursive && \
+    git apply /tmp/amd_patch/megatron.patch && \
+    sed -i '/from transformer_engine.pytorch.module.base import get_workspace/d' megatron/core/extensions/transformer_engine.py && \
+    sed -i '/workspace=get_workspace(),/d' megatron/core/extensions/transformer_engine.py && \
+    pip install -e . --no-deps
+
+RUN pip install git+${TORCH_MEMORY_SAVER_REPO}@${TORCH_MEMORY_SAVER_COMMIT} --no-cache-dir --force-reinstall --no-deps
+
+# PyJWT cleanup: prefer pip packages
+RUN rm -rf /usr/lib/python3/dist-packages/jwt /usr/lib/python3/dist-packages/PyJWT* && \
+    pip install -r /tmp/requirements.txt
+
+# Ray/CLI pins: miles-dsv4-fixed match
+RUN pip install "ray[default]==2.55.1" "typer==0.25.1" "click==8.3.3"
+
+# numpy 1.x: Megatron compat
+RUN pip install "numpy<2"
+
+# ====================================== Runtime package checks ==========================================
+
+RUN python -c "import mbridge, sglang, sgl_kernel, torch, transformer_engine; import megatron.core; print('DSv4 runtime imports: OK')"
+
+# ====================================== Runtime knobs ============================================
+
+# ROCm/SGLang runtime defaults
+ENV HIP_FORCE_DEV_KERNARG=1
+ENV HSA_NO_SCRATCH_RECLAIM=1
+ENV SGLANG_USE_AITER=1
+ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+ENV SGLANG_MOE_PADDING=1
+ENV SGLANG_SET_CPU_AFFINITY=1
+ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
+ENV SGLANG_USE_ROCM700A=1
+ENV NCCL_MIN_NCHANNELS=112
+ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
+ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
+
+RUN rm -rf /root/.cache/pip /root/TransformerEngine /tmp/amd_patch
+
+WORKDIR /root/
+
+CMD ["/usr/bin/bash"]
