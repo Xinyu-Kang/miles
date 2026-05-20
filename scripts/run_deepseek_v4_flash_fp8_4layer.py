@@ -152,7 +152,6 @@ def _execute(args: ScriptArgs) -> None:
         "--no-offload-train "
         "--no-offload-rollout "
         "--use-fault-tolerance "
-        "--use-rollout-routing-replay "
         "--use-miles-router "
         f"--dump-details {args.output_dir}/{args.run_id}/dump_details "
     )
