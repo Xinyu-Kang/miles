@@ -78,15 +78,28 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
     def _get_safetensor_io(self, weights_path: str):
         return _RawNameRemapSafeTensorIO(super()._get_safetensor_io(weights_path))
 
+    def _get_transformer_layer_spec(self, vp_stage=None):
+        from miles_plugins.models.deepseek_v4.deepseek_v4 import get_dsv4_spec
+
+        self.has_vp_stage = True
+        return get_dsv4_spec(None, self.config, vp_stage)
+
     def _build_config(self):
+        # SGLang's temporary HF config loader reuses DeepSeek-V3 config classes for
+        # V4, which injects the V3 default first_k_dense_replace=3. Official
+        # DeepSeek-V4-Flash is MoE from layer 0, so keep every layer on the MoE
+        # path or weight loading will request nonexistent dense MLP weights.
+        self.hf_config.first_k_dense_replace = 0
         config = super()._build_config()
 
         config.attention_backend = AttnBackend.auto
 
         config.experimental_attention_variant = "dsv4"
+        config.dsv4_mode = True
         config.dsa_indexer_n_heads = getattr(self.hf_config, "index_n_heads", 64)
         config.dsa_indexer_head_dim = getattr(self.hf_config, "index_head_dim", 128)
         config.dsa_indexer_topk = getattr(self.hf_config, "index_topk", 512)
+        config.vocab_size = self.hf_config.vocab_size
 
         config.dsv4_hc_mult = getattr(self.hf_config, "hc_mult", 4)
         config.dsv4_hc_sinkhorn_iters = getattr(self.hf_config, "hc_sinkhorn_iters", 20)
@@ -162,17 +175,93 @@ class _RawNameRemapSafeTensorIO:
     @staticmethod
     def _dequant_raw_fp8_weight(weight, scale):
         import torch
-        from mbridge.models.ext.deepseek_v3.kernel import weight_dequant
 
-        old_default_dtype = torch.get_default_dtype()
-        try:
-            torch.set_default_dtype(torch.bfloat16)
-            return weight_dequant(weight.contiguous(), scale.contiguous())
-        finally:
-            torch.set_default_dtype(old_default_dtype)
+        if weight.dtype == torch.float8_e4m3fn:
+            return _dequant_raw_fp8_block_weight(weight, scale)
+
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if weight.dtype in (torch.int8, torch.uint8) or (
+            fp4_dtype is not None and weight.dtype == fp4_dtype
+        ):
+            return _dequant_raw_fp4x2_block_weight(weight, scale)
+
+        raise TypeError(
+            f"Unsupported V4 quantized weight dtype {weight.dtype} with scale dtype {scale.dtype}"
+        )
 
     def load_one_hf_weight(self, hf_weight_name):
         return self.load_some_hf_weight([hf_weight_name])[hf_weight_name]
 
     def load_hf_weight_names(self):
         return list(self.index.keys())
+
+
+def _float8_e8m0_to_float(scale):
+    import torch
+
+    if scale.dtype != torch.float8_e8m0fnu:
+        return scale.float()
+
+    e = scale.contiguous().view(torch.uint8).to(torch.float32)
+    e = torch.clamp(e, max=254)
+    out = torch.exp2(e - 127.0)
+    return torch.where(e == 0, torch.zeros_like(out), out).view(scale.shape)
+
+
+def _dequant_raw_fp8_block_weight(weight, scale):
+    import torch
+
+    if scale.dtype != torch.float8_e8m0fnu:
+        raise TypeError(f"expected V4 e8m0 scale for fp8 weight, got {scale.dtype}")
+    if weight.dim() != 2 or scale.dim() != 2:
+        raise ValueError(f"expected 2D fp8 weight/scale, got {weight.shape} and {scale.shape}")
+
+    block_m = block_n = 128
+    m, n = weight.shape
+    if m % block_m != 0 or n % block_n != 0:
+        raise ValueError(f"fp8 weight shape must be divisible by 128, got {weight.shape}")
+    expected_scale_shape = (m // block_m, n // block_n)
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"fp8 scale shape {tuple(scale.shape)} does not match weight shape "
+            f"{tuple(weight.shape)}; expected {expected_scale_shape}"
+        )
+
+    weight_f32 = weight.float().view(m // block_m, block_m, n // block_n, block_n)
+    scale_f32 = _float8_e8m0_to_float(scale).view(m // block_m, 1, n // block_n, 1)
+    return (weight_f32 * scale_f32).view(m, n).to(torch.bfloat16)
+
+
+def _dequant_raw_fp4x2_block_weight(weight, scale):
+    import torch
+
+    if scale.dtype != torch.float8_e8m0fnu:
+        raise TypeError(f"expected V4 e8m0 scale for fp4 weight, got {scale.dtype}")
+    if weight.dim() != 2 or scale.dim() != 2:
+        raise ValueError(f"expected 2D fp4 weight/scale, got {weight.shape} and {scale.shape}")
+
+    m, packed_n = weight.shape
+    n = packed_n * 2
+    expected_scale_shape = (m, n // 32)
+    if n % 32 != 0 or tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"fp4 scale shape {tuple(scale.shape)} does not match packed weight shape "
+            f"{tuple(weight.shape)}; expected {expected_scale_shape}"
+        )
+
+    packed = weight.contiguous().view(torch.uint8)
+    lo = torch.remainder(packed, 16).to(torch.long)
+    hi = torch.div(packed, 16, rounding_mode="floor").to(torch.long)
+
+    table = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=torch.bfloat16,
+        device=weight.device,
+    )
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=weight.device)
+    out[:, 0::2] = table[lo]
+    out[:, 1::2] = table[hi]
+
+    scale_bf16 = _float8_e8m0_to_float(scale).to(torch.bfloat16).view(m, n // 32, 1)
+    out.view(m, n // 32, 32).mul_(scale_bf16)
+    return out

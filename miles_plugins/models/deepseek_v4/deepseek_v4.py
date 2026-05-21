@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAIndexerSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -42,7 +43,12 @@ from .ops.v4_indexer import V4Indexer
 #   - 0415 uses compress_rope_theta=160000 (was 40000 on 2604)
 # Default "2604" preserves existing behavior.
 _DSV4_CKPT_VERSION = os.environ.get("MILES_DSV4_CKPT_VERSION", "2604")
+_DSV4_2604_SUBMODE = os.environ.get(
+    "MILES_DSV4_2604_SUBMODE",
+    os.environ.get("SGLANG_DSV4_2604_SUBMODE", "2604B"),
+)
 _IS_0415 = _DSV4_CKPT_VERSION == "0415"
+_IS_2604B = _DSV4_CKPT_VERSION == "2604" and _DSV4_2604_SUBMODE == "2604B"
 
 
 class DeepSeekV4Attention(MegatronModule):
@@ -175,7 +181,7 @@ class DeepSeekV4Attention(MegatronModule):
                 self.indexer = None
 
         rope_base = config.dsv4_compress_rope_theta if self.compress_ratio else config.rotary_base
-        yarn_disabled = _IS_0415 and not self.compress_ratio
+        yarn_disabled = (_IS_0415 or _IS_2604B) and not self.compress_ratio
         freqs_cis = wrapped_precompute_freqs_cis(
             config, rope_head_dim=self.rope_head_dim, base=rope_base, yarn_disabled=yarn_disabled
         )
@@ -329,6 +335,7 @@ class DeepSeekV4Attention(MegatronModule):
 def _dsv4_attention_module_spec(config, backend=None):
     return ModuleSpec(
         module=DeepSeekV4Attention,
+        params={"attn_mask_type": AttnMaskType.causal},
         submodules=None,
         metainfo={"fuse_input_layernorm": False},
     )
