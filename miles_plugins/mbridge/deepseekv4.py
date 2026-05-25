@@ -101,6 +101,12 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
         config.dsa_indexer_topk = getattr(self.hf_config, "index_topk", 512)
         config.vocab_size = self.hf_config.vocab_size
 
+        # SGLang's DSV4 implementation only applies HF scoring_func to the
+        # deterministic hash-routed layers. The later expert-bias routed layers
+        # go through biased_grouped_topk, which is sigmoid based. Keep the base
+        # MBridge/Megatron router score function for those normal MoE layers;
+        # the Megatron DSV4 hash-router patch specializes hash layers instead.
+        config.dsv4_hash_router_score_function = getattr(self.hf_config, "scoring_func", "sqrtsoftplus")
         config.dsv4_hc_mult = getattr(self.hf_config, "hc_mult", 4)
         config.dsv4_hc_sinkhorn_iters = getattr(self.hf_config, "hc_sinkhorn_iters", 20)
         config.dsv4_hc_eps = getattr(self.hf_config, "hc_eps", 1e-6)
@@ -112,11 +118,21 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
         if config.dsv4_swiglu_limit > 0:
             config.bias_activation_fusion = False
             config.activation_func_clamp_value = config.dsv4_swiglu_limit
+            if getattr(self.hf_config, "expert_dtype", None) == "fp4":
+                config.activation_func_clamp_shared_expert = False
 
         config.dsv4_o_groups = getattr(self.hf_config, "o_groups", 8)
         config.dsv4_o_lora_rank = getattr(self.hf_config, "o_lora_rank", 1024)
-        config.dsv4_n_hash_layers = getattr(self.hf_config, "n_hash_layers", 3)
-        config.dsv4_window_size = getattr(self.hf_config, "window_size", 128)
+        config.dsv4_n_hash_layers = getattr(
+            self.hf_config,
+            "num_hash_layers",
+            getattr(self.hf_config, "n_hash_layers", 3),
+        )
+        config.dsv4_window_size = getattr(
+            self.hf_config,
+            "sliding_window",
+            getattr(self.hf_config, "window_size", 128),
+        )
 
         return config
 

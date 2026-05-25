@@ -18,3 +18,26 @@ diff --git a/megatron/legacy/fused_kernels/__init__.py b/megatron/legacy/fused_k
  
      # Check if cuda 11 is installed for compute capability 8.0
      cc_flag = []
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -702,6 +702,10 @@ def topk_routing_with_score_function(
+     else:
+         compute_topk = _compute_topk
+ 
++    dsv4_hash_routing = tid2eid is not None
++    if dsv4_hash_routing:
++        score_function = "sqrtsoftplus"
++
+     if score_function == "softmax":
+         if use_pre_softmax:
+             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+@@ -739,7 +743,7 @@ def topk_routing_with_score_function(
+     else:
+         raise ValueError(f"Invalid score_function: {score_function}")
+ 
+-    if scaling_factor:
++    if scaling_factor and not dsv4_hash_routing:
+         probs = probs * scaling_factor
+ 
+     if torch.are_deterministic_algorithms_enabled():

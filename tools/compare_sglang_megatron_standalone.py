@@ -510,11 +510,44 @@ def _patch_dsv4_router_tid2eid_device() -> None:
     TopKRouter._miles_dsv4_tid2eid_device_patch = True
 
 
+def _patch_dsv4_hash_router_scaling() -> None:
+    """Match SGLang's DeepSeek-V4 hash-router weighting.
+
+    SGLang's HashTopK uses sqrtsoftplus for hash-selected experts, normalizes
+    those routed weights, and does not apply routed_scaling_factor in the hash
+    layers. Megatron's generic router uses one score function and applies
+    moe_router_topk_scaling_factor unconditionally. That makes the first DSV4
+    hash layers diverge before the residual path and quickly shows up as a
+    logprob tail. Keep the generic Megatron path intact and only specialize the
+    deterministic tid2eid hash table path.
+    """
+
+    from megatron.core.transformer.moe import moe_utils
+    from megatron.core.transformer.moe import router as router_mod
+
+    if getattr(moe_utils, "_miles_dsv4_hash_router_scaling_patch", False):
+        return
+
+    original = moe_utils.topk_routing_with_score_function
+
+    def topk_routing_with_score_function(*args, **kwargs):
+        if kwargs.get("tid2eid") is not None:
+            kwargs = dict(kwargs)
+            kwargs["scaling_factor"] = None
+            kwargs["score_function"] = "sqrtsoftplus"
+        return original(*args, **kwargs)
+
+    moe_utils.topk_routing_with_score_function = topk_routing_with_score_function
+    router_mod.topk_routing_with_score_function = topk_routing_with_score_function
+    moe_utils._miles_dsv4_hash_router_scaling_patch = True
+
+
 def _build_megatron_model(args: argparse.Namespace) -> Any:
     import torch
 
     _init_megatron_parallel(args)
     _patch_dsv4_router_tid2eid_device()
+    _patch_dsv4_hash_router_scaling()
 
     from miles.utils.transformers_patch import apply_transformers_patch
 
@@ -743,6 +776,211 @@ def command_megatron_score_mbridge(args: argparse.Namespace) -> None:
     if rank == 0:
         _write_jsonl(args.output, out_rows)
         print(f"Wrote {len(out_rows)} Megatron score records to {args.output}")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _tensor_stats(value: Any) -> Json:
+    import torch
+
+    if isinstance(value, (tuple, list)):
+        value = value[0] if value else None
+    if not isinstance(value, torch.Tensor):
+        return {"type": type(value).__name__}
+    detached = value.detach()
+    finite = detached.float()
+    if finite.numel() == 0:
+        return {
+            "shape": list(detached.shape),
+            "dtype": str(detached.dtype),
+            "numel": 0,
+        }
+    return {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "numel": int(detached.numel()),
+        "mean": float(finite.mean().cpu()),
+        "std": float(finite.std(unbiased=False).cpu()),
+        "min": float(finite.min().cpu()),
+        "max": float(finite.max().cpu()),
+        "l2": float(torch.linalg.vector_norm(finite).cpu()),
+    }
+
+
+def _get_decoder_layer(model: Any, index: int) -> Any:
+    seen: set[int] = set()
+    queue = [model]
+    for candidate in queue:
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        decoder = getattr(candidate, "decoder", None)
+        layers = getattr(decoder, "layers", None)
+        if layers is not None:
+            return layers[index]
+        for attr in ("module", "model", "_module"):
+            child = getattr(candidate, attr, None)
+            if child is not None and id(child) not in seen:
+                queue.append(child)
+
+    matched = []
+    named_modules = getattr(model, "named_modules", None)
+    if named_modules is not None:
+        for _name, module in named_modules():
+            mlp = getattr(module, "mlp", None)
+            if mlp is not None and getattr(mlp, "router", None) is not None:
+                matched.append(module)
+    if matched:
+        return matched[index]
+
+    raise AttributeError("Could not find a Megatron decoder layer with mlp.router")
+
+
+def command_megatron_debug_first_layer(args: argparse.Namespace) -> None:
+    """Dump first-layer router and tensor summaries for DSV4 Megatron debugging."""
+
+    import torch
+    import torch.distributed as dist
+    from argparse import Namespace
+
+    model = _build_megatron_model(args)
+
+    from megatron.core import parallel_state
+    from miles.backends.megatron_utils.parallel import get_packed_seq_params
+    from miles.backends.training_utils.data import DataIterator, get_batch
+
+    _set_miles_parallel_state_from_megatron()
+
+    rank, _, _ = _dist_rank_info()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    rows = _read_jsonl(args.input)
+    if not rows:
+        raise ValueError(f"{args.input} is empty")
+    row = rows[args.row_index]
+
+    layer = _get_decoder_layer(model, args.layer_index)
+    debug: Json = {
+        "rank": rank,
+        "layer_index": args.layer_index,
+        "sample_id": _sample_id(row, args.row_index),
+        "config": {},
+        "stats": {},
+    }
+    layer_config = getattr(layer, "config", None)
+    if layer_config is not None:
+        for key in (
+            "experimental_attention_variant",
+            "dsv4_n_hash_layers",
+            "moe_router_score_function",
+            "moe_router_topk",
+            "moe_router_topk_scaling_factor",
+            "moe_router_enable_expert_bias",
+        ):
+            debug["config"][key] = getattr(layer_config, key, None)
+
+    handles = []
+
+    def pre_layer_hook(_module, inputs):
+        debug["stats"]["layer_input"] = _tensor_stats(inputs[0] if inputs else None)
+
+    def layer_hook(_module, _inputs, output):
+        debug["stats"]["layer_output"] = _tensor_stats(output)
+
+    def router_hook(module, _inputs, _kwargs, output):
+        probs, routing_map = output
+        probs2d = probs.detach().float().view(-1, probs.shape[-1])
+        routing2d = routing_map.detach().bool().view(-1, routing_map.shape[-1])
+        selected_counts = routing2d.sum(dim=1)
+        prob_sums = probs2d.sum(dim=1)
+        sample_routes = []
+        for token_pos in range(min(args.max_tokens, probs2d.shape[0])):
+            expert_ids = torch.nonzero(routing2d[token_pos], as_tuple=False).flatten()
+            expert_probs = probs2d[token_pos, expert_ids]
+            sample_routes.append(
+                {
+                    "token_pos": token_pos,
+                    "expert_ids": [int(x) for x in expert_ids.cpu().tolist()],
+                    "expert_probs": [float(x) for x in expert_probs.cpu().tolist()],
+                    "prob_sum": float(prob_sums[token_pos].cpu()),
+                }
+            )
+        debug["router"] = {
+            "hash_layer": getattr(module, "tid2eid", None) is not None,
+            "has_expert_bias": getattr(module, "expert_bias", None) is not None,
+            "selected_count_min": int(selected_counts.min().cpu()),
+            "selected_count_max": int(selected_counts.max().cpu()),
+            "prob_sum_mean": float(prob_sums.mean().cpu()),
+            "prob_sum_min": float(prob_sums.min().cpu()),
+            "prob_sum_max": float(prob_sums.max().cpu()),
+            "sample_routes": sample_routes,
+        }
+
+    handles.append(layer.register_forward_pre_hook(pre_layer_hook))
+    handles.append(layer.register_forward_hook(layer_hook))
+    if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "router"):
+        raise AttributeError("Could not find layer.mlp.router on Megatron layer")
+    handles.append(layer.mlp.router.register_forward_hook(router_hook, with_kwargs=True))
+
+    full_ids = _full_ids_from_record(row)
+    score_length = int(row.get("score_length", len(row.get("score_token_ids", []))))
+    rollout_data: dict[str, Any] = {
+        "tokens": [torch.tensor(full_ids, dtype=torch.long, device=device)],
+        "loss_masks": [torch.ones(score_length, dtype=torch.int, device=device)],
+        "total_lengths": [len(full_ids)],
+        "response_lengths": [score_length],
+    }
+    if args.qkv_format == "bshd":
+        max_seq_len = _pad_bshd_max_len([len(full_ids)], tp_size, args.data_pad_size_multiplier)
+        rollout_data["max_seq_lens"] = [max_seq_len]
+
+    runtime_args = Namespace(
+        qkv_format=args.qkv_format,
+        data_pad_size_multiplier=args.data_pad_size_multiplier,
+        allgather_cp=False,
+        log_probs_chunk_size=args.log_probs_chunk_size,
+        true_on_policy_mode=args.true_on_policy_mode,
+        rollout_temperature=args.temperature,
+        use_rollout_entropy=False,
+        bf16=_torch_dtype(args.dtype) is torch.bfloat16,
+        fp16=_torch_dtype(args.dtype) is torch.float16,
+        vocab_size=args.vocab_size,
+    )
+
+    iterator = DataIterator(rollout_data, micro_batch_size=1)
+    batch = get_batch(
+        iterator,
+        ["tokens", "loss_masks", "total_lengths", "response_lengths", "max_seq_lens"],
+        args.data_pad_size_multiplier,
+        args.qkv_format,
+        allgather_cp=False,
+    )
+    packed_seq_params = get_packed_seq_params(batch, runtime_args)
+    with torch.no_grad():
+        model(
+            input_ids=batch["tokens"],
+            position_ids=None,
+            attention_mask=None,
+            labels=None,
+            packed_seq_params=packed_seq_params,
+            loss_mask=batch["full_loss_masks"],
+        )
+
+    for handle in handles:
+        handle.remove()
+
+    out_path = args.output.with_name(f"{args.output.stem}.rank{rank}{args.output.suffix}")
+    _write_json(out_path, debug)
+    if rank == 0:
+        print(f"Wrote first-layer debug records to {args.output.parent}/{args.output.stem}.rank*.json")
+        if "router" in debug:
+            print(
+                "rank0 router: "
+                f"hash_layer={debug['router']['hash_layer']} "
+                f"prob_sum_mean={debug['router']['prob_sum_mean']:.6f} "
+                f"range=[{debug['router']['prob_sum_min']:.6f}, {debug['router']['prob_sum_max']:.6f}]"
+            )
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -1142,6 +1380,38 @@ def build_parser() -> argparse.ArgumentParser:
     meg.add_argument("--extra-provider-args", default=None, help="JSON dict passed to mbridge get_model().")
     meg.add_argument("--progress", action="store_true")
     meg.set_defaults(func=command_megatron_score_mbridge)
+
+    dbg = sub.add_parser(
+        "megatron-debug-first-layer",
+        help="Dump first-layer Megatron router stats. Run with torchrun for TP > 1.",
+    )
+    dbg.add_argument("--input", type=Path, required=True)
+    dbg.add_argument("--output", type=Path, required=True)
+    dbg.add_argument("--model-path", required=True, help="HF checkpoint/model path used by mbridge.")
+    dbg.add_argument("--weight-path", default=None, help="Optional weight path; defaults to --model-path.")
+    dbg.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "bf16", "float16", "fp16", "float32", "fp32"])
+    dbg.add_argument("--qkv-format", choices=["bshd", "thd"], default="bshd")
+    dbg.add_argument("--temperature", type=float, default=1.0)
+    dbg.add_argument("--tensor-model-parallel-size", type=int, default=1)
+    dbg.add_argument("--pipeline-model-parallel-size", type=int, default=1)
+    dbg.add_argument("--context-parallel-size", type=int, default=1)
+    dbg.add_argument("--expert-model-parallel-size", type=int, default=1)
+    dbg.add_argument("--expert-tensor-parallel-size", type=int, default=1)
+    dbg.add_argument("--data-pad-size-multiplier", type=int, default=128)
+    dbg.add_argument("--log-probs-chunk-size", type=int, default=-1)
+    dbg.add_argument("--true-on-policy-mode", action="store_true")
+    dbg.add_argument(
+        "--keep-mtp",
+        action="store_true",
+        help="Build the checkpoint's MTP block. By default it is disabled because normal logprob scoring does not use it.",
+    )
+    dbg.add_argument("--vocab-size", type=int, default=None)
+    dbg.add_argument("--dist-backend", default="auto", choices=["auto", "nccl", "gloo", "mpi"])
+    dbg.add_argument("--extra-provider-args", default=None, help="JSON dict passed to mbridge get_model().")
+    dbg.add_argument("--row-index", type=int, default=0)
+    dbg.add_argument("--layer-index", type=int, default=0)
+    dbg.add_argument("--max-tokens", type=int, default=8)
+    dbg.set_defaults(func=command_megatron_debug_first_layer)
 
     cmp_parser = sub.add_parser("compare", help="Compare two JSONL score files.")
     cmp_parser.add_argument("--left", type=Path, required=True)
