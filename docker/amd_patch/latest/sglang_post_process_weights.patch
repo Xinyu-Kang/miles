@@ -209,3 +209,91 @@
      def update_weights_from_disk(
          self,
          model_path: str,
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -1665,6 +1665,66 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+         if hasattr(layer, "dispatcher"):
+             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+ 
++    def restore_weights_before_loading(self, layer: Module) -> None:
++        if not (_use_aiter_moe() and self.is_fp4_expert):
++            return
++
++        def replace_parameter(name: str, data: torch.Tensor) -> None:
++            old_param = getattr(layer, name)
++            new_param = torch.nn.Parameter(data, requires_grad=False)
++            for attr, value in getattr(old_param, "__dict__", {}).items():
++                setattr(new_param, attr, value)
++            if hasattr(new_param, "is_shuffled"):
++                new_param.is_shuffled = False
++            setattr(layer, name, new_param)
++
++        device = layer.w13_weight.device
++        num_experts = layer.num_local_experts
++        hidden_size = layer.hidden_size
++        intermediate_size = layer.intermediate_size_per_partition
++        fp4_block_k = 32
++
++        replace_parameter(
++            "w13_weight",
++            torch.empty(
++                num_experts,
++                2 * intermediate_size,
++                hidden_size // 2,
++                dtype=torch.int8,
++                device=device,
++            ),
++        )
++        replace_parameter(
++            "w2_weight",
++            torch.empty(
++                num_experts,
++                hidden_size,
++                intermediate_size // 2,
++                dtype=torch.int8,
++                device=device,
++            ),
++        )
++        replace_parameter(
++            "w13_weight_scale_inv",
++            torch.empty(
++                num_experts,
++                2 * intermediate_size,
++                hidden_size // fp4_block_k,
++                dtype=torch.float8_e8m0fnu,
++                device=device,
++            ),
++        )
++        replace_parameter(
++            "w2_weight_scale_inv",
++            torch.empty(
++                num_experts,
++                hidden_size,
++                intermediate_size // fp4_block_k,
++                dtype=torch.float8_e8m0fnu,
++                device=device,
++            ),
++        )
++
+     def process_weights_hip_int4(self, layer: Module):
+         # TODO: _use_aiter: add after triton kernel added
+         # INT4-FP8 (INT4 MoE Weight, FP8 Compute)
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -3001,8 +3001,14 @@ class DeepseekV4ForCausalLM(nn.Module):
+                                 )
+                                 loaded_params.add(name)
+                 except Exception as e:
+-                    e.add_note(f"{name=} {loaded_weight.shape=}")
+-                    raise
++                    note = (
++                        f"{name=} {loaded_weight.shape=} "
++                        f"{loaded_weight.dtype=}"
++                    )
++                    if hasattr(e, "add_note"):
++                        e.add_note(note)
++                        raise
++                    raise RuntimeError(f"{note}: {e}") from e
+ 
+             # Wait for all tasks to complete and raise any exceptions.
+             for future in concurrent.futures.as_completed(futures):

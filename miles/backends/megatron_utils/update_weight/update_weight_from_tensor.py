@@ -1,4 +1,5 @@
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -23,6 +24,14 @@ from .update_weight_from_distributed.broadcast import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _should_restore_rollout_weights_before_load(
+    quantization_config: dict[str, int | str | list[str]] | None,
+) -> bool:
+    if quantization_config and quantization_config.get("quant_method") in ["compressed-tensors"]:
+        return True
+    return os.environ.get("SGLANG_DSV4_FP4_EXPERTS", "").lower() in ("1", "true", "yes")
 
 
 class UpdateWeightFromTensor:
@@ -179,7 +188,7 @@ class UpdateWeightFromTensor:
             mode = self.args.pause_generation_mode
             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if _should_restore_rollout_weights_before_load(self.quantization_config):
                 post_process_weights(
                     rollout_engines=self.rollout_engines,
                     restore_weights_before_load=True,

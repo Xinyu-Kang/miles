@@ -164,10 +164,16 @@ def named_params_and_buffers(
 
 
 def _maybe_get_cpu_backup(x: torch.Tensor):
+    if not x.is_cuda:
+        return x
+
     from torch_memory_saver import torch_memory_saver
 
-    if (cpu_tensor := torch_memory_saver.get_cpu_backup(x)) is not None:
-        return cpu_tensor
+    try:
+        if (cpu_tensor := torch_memory_saver.get_cpu_backup(x)) is not None:
+            return cpu_tensor
+    except Exception:
+        logger.debug("torch_memory_saver.get_cpu_backup failed; using live tensor", exc_info=True)
 
     return x
 

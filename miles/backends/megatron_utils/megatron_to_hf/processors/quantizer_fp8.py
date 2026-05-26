@@ -1,3 +1,4 @@
+import os
 import re
 
 import torch
@@ -43,7 +44,10 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
                 # TODO: find a clearer way.
                 if converted_name.endswith("_scale"):
                     continue
-                quantize_named_params.extend(_quantize_param(args, converted_name, param, weight_block_size))
+                if _should_quantize_dsv4_routed_expert_to_fp4(args, converted_name):
+                    quantize_named_params.extend(_quantize_param_dsv4_fp4_expert(converted_name, param))
+                else:
+                    quantize_named_params.extend(_quantize_param(args, converted_name, param, weight_block_size))
 
             return quantize_named_params
 
@@ -109,6 +113,47 @@ def _quantize_param(args, name, weight, weight_block_size):
         scale = scale.view(1)
         scale_name = name.replace(".weight", ".weight_scale")
     return [(name, qweight), (scale_name, scale)]
+
+
+def _should_quantize_dsv4_routed_expert_to_fp4(args, name):
+    if os.getenv("SGLANG_DSV4_FP4_EXPERTS", "").lower() not in ("1", "true", "yes"):
+        return False
+    if getattr(args, "model_name", None) != "deepseekv4":
+        return False
+    if ".mlp.experts." not in name or not name.endswith(".weight"):
+        return False
+    return any(
+        name.endswith(suffix)
+        for suffix in (
+            ".gate_proj.weight",
+            ".up_proj.weight",
+            ".down_proj.weight",
+        )
+    )
+
+
+def _quantize_param_dsv4_fp4_expert(name, weight):
+    assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
+    if weight.dim() != 2:
+        raise ValueError(f"DeepSeek V4 FP4 expert quantization expects a 2D weight, got {name}: {weight.shape}")
+    if weight.shape[-1] % 32 != 0:
+        raise ValueError(
+            f"DeepSeek V4 FP4 expert quantization requires the input dimension to be divisible by 32, "
+            f"got {name}: {weight.shape}"
+        )
+    if not weight.is_cuda:
+        weight = weight.cuda()
+
+    # DeepSeek V4 Flash stores routed experts as packed E2M1 FP4, with one UE8M0
+    # scale per 1x32 block along the input dimension. This matches SGLang's
+    # AITER PER_1X32 MoE path. The post-load SGLang hook shuffles weights/scales.
+    from aiter import QuantType, get_hip_quant
+
+    qweight, scale = get_hip_quant(QuantType.per_1x32)(weight.contiguous(), shuffle=False)
+    if qweight.dtype != torch.int8:
+        qweight = qweight.view(torch.int8)
+    scale_name = name.replace(".weight", ".weight_scale_inv")
+    return [(name, qweight.contiguous()), (scale_name, scale.contiguous())]
 
 
 def _get_scale_format(args, name, weight_block_size):

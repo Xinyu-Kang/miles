@@ -2,6 +2,7 @@ import logging
 import socket
 
 import ray
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -134,6 +135,15 @@ def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role: str, with
     )
 
 
+def _rollout_offload_tags(args):
+    tags = [GPU_MEMORY_TYPE_CUDA_GRAPH]
+    if "kv_cache" in args.offload_rollout_level:
+        tags.append(GPU_MEMORY_TYPE_KV_CACHE)
+    if "weight" in args.offload_rollout_level:
+        tags.append(GPU_MEMORY_TYPE_WEIGHTS)
+    return tags
+
+
 async def create_training_models(args, pgs, rollout_manager):
     actor_model = allocate_train_group(
         args=args,
@@ -190,6 +200,6 @@ def create_rollout_manager(args, pg):
         ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
 
     if args.offload_rollout:
-        ray.get(rollout_manager.offload.remote())
+        ray.get(rollout_manager.offload.remote(tags=_rollout_offload_tags(args)))
 
     return rollout_manager, num_rollout_per_epoch

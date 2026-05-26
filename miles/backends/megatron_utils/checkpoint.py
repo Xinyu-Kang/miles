@@ -1,7 +1,6 @@
 import logging
 import os
 import re
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -240,18 +239,6 @@ def _load_checkpoint_hf_with_mbridge(ddp_model, optimizer, args, load_path: str)
 
     Bridge._weight_to_mcore_format = patched_method
 
-    load_context = nullcontext()
-    if getattr(args, "offload_train", False):
-        try:
-            from torch_memory_saver import torch_memory_saver
-
-            torch_memory_saver._ensure_initialized()
-            cdll = torch_memory_saver._impl._binary_wrapper.cdll
-            if cdll.tms_get_interesting_region():
-                load_context = torch_memory_saver.disable()
-        except Exception:
-            logger.warning("torch_memory_saver disable failed during mbridge load", exc_info=True)
-
     bridge_kwargs = {"trust_remote_code": True}
     vocab_divisor = getattr(args, "make_vocab_size_divisible_by", None)
     if vocab_divisor is not None:
@@ -266,8 +253,17 @@ def _load_checkpoint_hf_with_mbridge(ddp_model, optimizer, args, load_path: str)
             if hf_vocab_size is not None and padded_vocab_size is not None:
                 bridge.vocab_size = hf_vocab_size
                 bridge.padded_vocab_size = padded_vocab_size
-            with load_context:
-                bridge.load_weights(unwrap_model(ddp_model), load_path, memory_efficient=False)
+            memory_efficient_load = os.environ.get("MILES_MBRIDGE_MEMORY_EFFICIENT_LOAD", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            logger.info("mbridge HF load memory_efficient=%s", memory_efficient_load)
+            bridge.load_weights(
+                unwrap_model(ddp_model),
+                load_path,
+                memory_efficient=memory_efficient_load,
+            )
     finally:
         Bridge._weight_to_mcore_format = original_method
         device_module.get_device_name = original_device_fn
