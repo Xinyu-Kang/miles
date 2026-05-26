@@ -118,7 +118,7 @@
                  (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -3486,6 +3486,31 @@
+@@ -3486,6 +3486,34 @@
      def check_weights(self, action: str):
          return self._weight_checker.handle(action=action)
  
@@ -127,21 +127,24 @@
 +
 +        target_device = torch.device("cuda", torch.cuda.current_device())
 +
++        def supports_online_weight_post_process(quant_method):
++            return (
++                quant_method is not None
++                and hasattr(quant_method, "restore_weights_before_loading")
++                and hasattr(quant_method, "process_weights_after_loading")
++            )
++
 +        if recv_req.restore_weights_before_load:
 +            for _, module in self.model.named_modules():
 +                quant_method = getattr(module, "quant_method", None)
-+                if quant_method is not None and hasattr(
-+                    quant_method, "restore_weights_before_loading"
-+                ):
++                if supports_online_weight_post_process(quant_method):
 +                    with device_loading_context(module, target_device):
 +                        quant_method.restore_weights_before_loading(module)
 +
 +        if recv_req.post_process_quantization:
 +            for _, module in self.model.named_modules():
 +                quant_method = getattr(module, "quant_method", None)
-+                if quant_method is not None and hasattr(
-+                    quant_method, "process_weights_after_loading"
-+                ):
++                if supports_online_weight_post_process(quant_method):
 +                    with device_loading_context(module, target_device):
 +                        quant_method.process_weights_after_loading(module)
 +

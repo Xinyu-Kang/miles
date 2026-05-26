@@ -41,3 +41,40 @@ diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transfor
          probs = probs * scaling_factor
  
      if torch.are_deterministic_algorithms_enabled():
+diff --git a/megatron/core/distributed/param_and_grad_buffer.py b/megatron/core/distributed/param_and_grad_buffer.py
+--- a/megatron/core/distributed/param_and_grad_buffer.py
++++ b/megatron/core/distributed/param_and_grad_buffer.py
+@@ -4,7 +4,7 @@ import functools
+ import logging
+ import math
+ import warnings
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+ from enum import Enum
+ from functools import partial
+ from typing import Dict, List, Optional
+@@ -785,11 +785,19 @@ class _ParamAndGradBuffer:
+             if disable:
+                 from torch_memory_saver import torch_memory_saver
+ 
+-                return partial(
+-                    torch_memory_saver.region,
+-                    tag=tag,
+-                    enable_cpu_backup=False,
+-                )
++                @contextmanager
++                def no_backup_region():
++                    torch_memory_saver._ensure_initialized()
++                    cdll = torch_memory_saver._impl._binary_wrapper.cdll
++                    if cdll.tms_get_interesting_region():
++                        with torch_memory_saver.disable():
++                            with torch_memory_saver.region(tag=tag, enable_cpu_backup=False):
++                                yield
++                    else:
++                        with torch_memory_saver.region(tag=tag, enable_cpu_backup=False):
++                            yield
++
++                return no_backup_region
+             return nullcontext
+ 
+         grad_mem_alloc_context = _make_no_backup_context("grad_buffer", disable_grad_buffers_cpu_backup)
