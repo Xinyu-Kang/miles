@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 
 import ray
@@ -11,6 +12,28 @@ from miles.utils.timer import timer
 
 from ...megatron_to_hf import convert_to_hf
 from ..common import all_gather_param, collect_named_tensors_for_weight_transfer, post_process_weights
+
+
+_SGLANG_FUSION_PAIR_SUFFIXES = [
+    (".self_attention.wq_a.weight", ".self_attention.wkv.weight"),
+    (".self_attention.compressor.wkv.weight", ".self_attention.compressor.wgate.weight"),
+    (".self_attention.indexer.compressor.wkv.weight", ".self_attention.indexer.compressor.wgate.weight"),
+]
+
+
+def _sglang_fusion_pair_key(name: str) -> str | None:
+    for first_suffix, second_suffix in _SGLANG_FUSION_PAIR_SUFFIXES:
+        if name.endswith(first_suffix):
+            return name[: -len(first_suffix)] + first_suffix
+        if name.endswith(second_suffix):
+            return name[: -len(second_suffix)] + first_suffix
+    return None
+
+
+def _should_restore_rollout_weights_before_load(quantization_config: dict | None) -> bool:
+    if quantization_config and quantization_config.get("quant_method") in ["compressed-tensors"]:
+        return True
+    return os.environ.get("SGLANG_DSV4_FP4_EXPERTS", "").lower() in ("1", "true", "yes")
 
 
 class DistBucketedWeightUpdateMixin:
@@ -44,6 +67,32 @@ class DistBucketedWeightUpdateMixin:
 
         buffer_size = 0
         converted_named_tensors: list[tuple[str, torch.Tensor]] = []
+        pending_pairs: dict[str, list[tuple[str, torch.Tensor, int]]] = {}
+
+        def _flush_bucket() -> None:
+            nonlocal buffer_size, converted_named_tensors
+
+            if converted_named_tensors:
+                update_bucket_weight_func(converted_named_tensors, pbar)
+                converted_named_tensors = []
+                buffer_size = 0
+
+        def _commit_items(items: list[tuple[str, torch.Tensor, int]]) -> None:
+            nonlocal buffer_size, converted_named_tensors
+
+            items_size = sum(item_size for _, _, item_size in items)
+            if buffer_size + items_size > self.args.update_weight_buffer_size:
+                _flush_bucket()
+
+            for item_name, item_param, _ in items:
+                converted_named_tensors += convert_to_hf(
+                    self.args,
+                    self.model_name,
+                    item_name,
+                    item_param,
+                    self.quantization_config,
+                )
+            buffer_size += items_size
 
         for name, param in collect_named_tensors_for_weight_transfer(self.args, self.model, is_expert=False):
             param = all_gather_param(self.args, name, param)
@@ -51,16 +100,23 @@ class DistBucketedWeightUpdateMixin:
                 continue
 
             param_size = param.numel() * param.element_size()
-            if buffer_size + param_size > self.args.update_weight_buffer_size:
-                update_bucket_weight_func(converted_named_tensors, pbar)
-                converted_named_tensors = []
-                buffer_size = 0
+            pair_key = _sglang_fusion_pair_key(name)
+            if pair_key is None:
+                _commit_items([(name, param, param_size)])
+                continue
 
-            converted_named_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
-            buffer_size += param_size
+            items = pending_pairs.pop(pair_key, [])
+            items.append((name, param, param_size))
+            if len(items) == 2:
+                _commit_items(items)
+            else:
+                pending_pairs[pair_key] = items
 
-        if converted_named_tensors:
-            update_bucket_weight_func(converted_named_tensors, pbar)
+        if pending_pairs:
+            missing = {key: [name for name, _, _ in items] for key, items in pending_pairs.items()}
+            raise RuntimeError(f"Missing SGLang fusion-pair partner weights during online update: {missing}")
+
+        _flush_bucket()
 
     def _gather_and_update_expert_weights(
         self,
@@ -143,7 +199,7 @@ class DistBucketedWeightUpdateMixin:
                 ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
             # int4/fp4 pre_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if _should_restore_rollout_weights_before_load(self.quantization_config):
                 post_process_weights(
                     rollout_engines=self.rollout_engines,
                     restore_weights_before_load=True,

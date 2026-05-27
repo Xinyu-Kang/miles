@@ -16,6 +16,13 @@ from miles.utils.distributed_utils import init_process_group
 from .mixin import DistBucketedWeightUpdateMixin
 
 
+def _nccl_transport_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is not None and tensor.dtype is e8m0_dtype:
+        return tensor.view(torch.uint8)
+    return tensor
+
+
 class UpdateWeightFromDistributed(DistBucketedWeightUpdateMixin):
     """
     Update distributed engines via NCCL. Each PP rank: group "miles-pp_{pp_rank}",
@@ -176,7 +183,7 @@ def update_weights_from_distributed(
 
     handles = []
     for _, param in converted_named_tensors:
-        handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
+        handles.append(dist.broadcast(_nccl_transport_tensor(param.data), 0, group=group, async_op=True))
     for handle in handles:
         handle.wait()
 

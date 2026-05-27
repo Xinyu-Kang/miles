@@ -487,6 +487,12 @@ def train_one_step(
     dumper_phase_util.finalize(model)
 
     if not disable_optimizer and valid_step:
+        device = torch.cuda.current_device()
+        free, _ = torch.cuda.mem_get_info(device)
+        if free < 2 * 1024**3:
+            # TE FP8 Adam may need transient FP32 scratch tensors during step.
+            clear_memory()
+
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
