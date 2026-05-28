@@ -55,6 +55,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_weight_staleness: int | None = None
     use_tis: bool = False
 
+    fp8_training: bool = True
+    fp8_recipe: Literal["blockwise", "delayed", "tensorwise", "mxfp8"] = "blockwise"
     accumulate_allreduce_grads_in_fp32: bool = False
     train_memory_margin_bytes: int = 2 * 1024 * 1024 * 1024
     offload_train: bool = True
@@ -1008,7 +1010,6 @@ def _execute(args: ScriptArgs) -> None:
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
         "--attention-softmax-in-fp32 "
-        "--grad-reduce-in-bf16 "
         "--update-weight-buffer-size 268435456 "
         f"--update-weight-transfer-mode {args.update_weight_transfer_mode} "
         f"--train-memory-margin-bytes {args.train_memory_margin_bytes} "
@@ -1027,6 +1028,15 @@ def _execute(args: ScriptArgs) -> None:
         "--disable-weights-backuper "
         f"--dump-details {args.output_dir}/{args.run_id}/dump_details "
     )
+    if args.fp8_training:
+        misc_args += (
+            "--transformer-impl transformer_engine "
+            "--bf16 "
+            "--fp8-format e4m3 "
+            f"--fp8-recipe {args.fp8_recipe} "
+        )
+    else:
+        misc_args += "--grad-reduce-in-bf16 "
     if args.offload_train:
         misc_args += "--offload-train "
     else:
@@ -1078,7 +1088,7 @@ def _extra_env(args: ScriptArgs) -> dict[str, str]:
     visible_devices = ",".join(str(i) for i in range(args.num_gpus_per_node))
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
     no_proxy = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or f"localhost,127.0.0.1,0.0.0.0,{master_addr}"
-    return {
+    env = {
         "PYTHONPATH": pythonpath,
         "MASTER_ADDR": master_addr,
         "no_proxy": no_proxy,
@@ -1139,6 +1149,9 @@ def _extra_env(args: ScriptArgs) -> dict[str, str]:
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "RAY_DEDUP_LOGS": "0",
     }
+    if args.fp8_training and args.fp8_recipe == "blockwise":
+        env["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] = "1"
+    return env
 
 
 @U.dataclass_cli

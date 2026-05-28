@@ -79,16 +79,44 @@ def _get_megatron_full_params(
         for handle in handles:
             handle.wait()
 
+    # In colocate tensor-update mode each rollout TP rank is fed by the
+    # matching Megatron rank in a contiguous engine-sized chunk. With PP>1 and
+    # EP>1, an expert tensor whose true source rank is in another PP stage is
+    # first relayed to exactly one rank in the current EP group by the PP
+    # broadcast above. The following EP broadcast must use that relay rank as
+    # src; broadcasting from the local rank would send an uninitialized tensor.
+    ep_pp_relay_src_ranks = {}
+    if ep_size > 1 and pp_size > 1:
+        pp_group_ranks = tuple(dist.get_process_group_ranks(get_parallel_state().pp.group))
+        ep_peer_pp_groups = [None] * ep_size
+        dist.all_gather_object(
+            ep_peer_pp_groups,
+            (rank, pp_group_ranks),
+            group=get_parallel_state().ep.group,
+        )
+
+        expert_src_ranks = {info.src_rank for info in megatron_local_param_infos if ".experts." in info.name}
+        for src_rank in expert_src_ranks:
+            for peer_rank, peer_pp_group_ranks in ep_peer_pp_groups:
+                if src_rank in peer_pp_group_ranks:
+                    ep_pp_relay_src_ranks[src_rank] = peer_rank
+                    break
+
     # broadcast params across ep ranks
     if ep_size > 1:
         handles = []
+        ep_group_ranks = set(dist.get_process_group_ranks(get_parallel_state().ep.group))
         for info, param in zip(megatron_local_param_infos, params, strict=False):
             if ".experts." in info.name:
                 src_rank = (
-                    info.src_rank
-                    if info.src_rank in dist.get_process_group_ranks(get_parallel_state().ep.group)
-                    else rank
+                    info.src_rank if info.src_rank in ep_group_ranks else ep_pp_relay_src_ranks.get(info.src_rank)
                 )
+                if src_rank is None:
+                    raise RuntimeError(
+                        "Cannot locate expert tensor source for colocate weight update: "
+                        f"name={info.name}, original_src_rank={info.src_rank}, rank={rank}, "
+                        f"ep_group_ranks={sorted(ep_group_ranks)}"
+                    )
                 handles.append(
                     torch.distributed.broadcast(
                         param, src=src_rank, group=get_parallel_state().ep.group, async_op=True
