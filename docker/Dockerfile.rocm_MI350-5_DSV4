@@ -49,9 +49,11 @@ ENV CMAKE_PREFIX_PATH=/opt/rocm:/opt/rocm/hip:/usr/local:/usr
 
 # Local patches
 # - megatron.patch: ROCm fused-kernel/toolchain compat
-# - sglang_post_process_weights.patch: Megatron BF16 -> SGLang FP8 post-update hook
+# - sglang_post_process_weights.patch: SGLang online post-update hook
+# - dsv4_flash_sglang_runtime_patch.py: DeepSeek-V4-Flash FP4 online weight update fixes
 COPY docker/amd_patch/latest/megatron.patch /tmp/amd_patch/megatron.patch
 COPY docker/amd_patch/latest/sglang_post_process_weights.patch /tmp/amd_patch/sglang_post_process_weights.patch
+COPY docker/amd_patch/latest/dsv4_flash_sglang_runtime_patch.py /tmp/amd_patch/dsv4_flash_sglang_runtime_patch.py
 COPY requirements.txt /tmp/requirements.txt
 
 # ======================================== Apt dependencies =============================================
@@ -71,8 +73,10 @@ RUN git clone --depth 1 --branch ${RCCL_TESTS_BRANCH} ${RCCL_TESTS_REPO} /tmp/ro
 
 # ====================================== Python dependencies ============================================
 
-# SGLang: DSv4 base + local post-process patch only
-RUN cd /sgl-workspace/sglang && git apply /tmp/amd_patch/sglang_post_process_weights.patch
+# SGLang: DSv4 base + local online-update/post-process patches
+RUN cd /sgl-workspace/sglang && \
+    git apply /tmp/amd_patch/sglang_post_process_weights.patch && \
+    python3 /tmp/amd_patch/dsv4_flash_sglang_runtime_patch.py
 RUN python -c "import sglang, sgl_kernel, aiter; print('DSv4 SGLang base imports: OK')"
 
 # TE build: Megatron-side package

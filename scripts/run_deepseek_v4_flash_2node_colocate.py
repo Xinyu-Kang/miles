@@ -36,7 +36,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     megatron_path: str = "/root/Megatron-LM"
     num_gpus_per_node: int = 8
 
-    num_rollout: int | None = None
+    num_rollout: int | None = 1
     rollout_batch_size: int | None = None
     n_samples_per_prompt: int | None = None
     rollout_max_response_len: int | None = None
@@ -62,7 +62,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     offload_rollout_level: str = "kv_cache weight"
     optimizer: Literal["adam", "sgd"] = "adam"
     main_params_dtype: Literal["fp16", "fp32"] = "fp32"
-    optimizer_state_dtype: Literal["fp8", "bf16", "fp16", "fp32"] = "fp8"
+    optimizer_state_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
     tensor_model_parallel_size: int = 8
     pipeline_model_parallel_size: int = 2
     context_parallel_size: int = 1
@@ -194,7 +194,7 @@ def _detect_roce_gid_index() -> str:
 
 def _nccl_multinode_env() -> dict[str, str]:
     socket_ifname = _detect_socket_ifname()
-    env = {
+    return {
         "NCCL_SOCKET_IFNAME": socket_ifname,
         "GLOO_SOCKET_IFNAME": os.environ.get("GLOO_SOCKET_IFNAME", socket_ifname),
         "TP_SOCKET_IFNAME": os.environ.get("TP_SOCKET_IFNAME", socket_ifname),
@@ -215,7 +215,6 @@ def _nccl_multinode_env() -> dict[str, str]:
         f"NCCL_IB_GID_INDEX={env['NCCL_IB_GID_INDEX']}",
         flush=True,
     )
-    return env
 
 
 def _download_model_all_nodes(model_id: str, local_dir: str, args: ScriptArgs) -> None:
@@ -240,471 +239,71 @@ def _download_dataset_all_nodes(full_name: str, args: ScriptArgs) -> None:
         )
 
 
-def _patch_sglang_e8m0_nccl_transport_all_nodes(args: ScriptArgs) -> None:
-    # RCCL/NCCL in this ROCm stack cannot broadcast torch.float8_e8m0fnu
-    # tensors directly. DeepSeek-V4-Flash FP4 experts also arrive as packed
-    # int8 payloads but must be viewed as torch.float4_e2m1fn_x2 before SGLang
-    # copies them into its FP4 expert parameters.
-    patch_code = r'''
+def _verify_container_runtime_patches(args: ScriptArgs) -> None:
+    check_code = r'''
 from pathlib import Path
 
-path = Path("/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py")
-e8m0_sentinel = "MILES_E8M0_NCCL_TRANSPORT_PATCH"
-fp4_sentinel = "MILES_FP4_NCCL_TRANSPORT_PATCH"
-bucket_fp4_sentinel = "MILES_BUCKET_FP4_NCCL_TRANSPORT_PATCH"
-ffn_fp4_sentinel = "MILES_FFN_FP4_NCCL_TRANSPORT_PATCH"
-direct_ffn_fp4_sentinel = "MILES_DIRECT_FFN_FP4_NCCL_TRANSPORT_PATCH"
-tensor_bucket_ffn_fp4_sentinel = "MILES_TENSOR_BUCKET_FFN_FP4_NCCL_TRANSPORT_PATCH"
-text = path.read_text()
+checks = [
+    (
+        "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py",
+        "MILES_ONLINE_POSTPROCESS_SKIP_KV_CACHE_METHOD_PATCH",
+        "SGLang online post_process_weights process-only hook",
+    ),
+    (
+        "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py",
+        "MILES_FP4_NCCL_TRANSPORT_PATCH",
+        "SGLang FP4 NCCL transport view",
+    ),
+    (
+        "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py",
+        "MILES_BUCKET_FP4_NCCL_TRANSPORT_PATCH",
+        "SGLang bucketed FP4 NCCL transport view",
+    ),
+    (
+        "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py",
+        "MILES_TENSOR_BUCKET_FFN_FP4_NCCL_TRANSPORT_PATCH",
+        "SGLang FFN FP4 tensor-bucket transport view",
+    ),
+    (
+        "/sgl-workspace/sglang/python/sglang/srt/models/deepseek_v4.py",
+        "MILES_DSV4_LOADER_FP4_EXPERT_VIEW_PATCH",
+        "DeepSeek-V4 FP4 expert loader view",
+    ),
+    (
+        "/sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py",
+        "MILES_FUSED_MOE_FP4_EXPERT_COPY_PATCH",
+        "SGLang FusedMoE FP4 payload copy",
+    ),
+    (
+        "/sgl-workspace/sglang/python/sglang/srt/utils/weight_checker.py",
+        "MILES_WEIGHT_CHECKER_FP4_FINAL_SKIP_PATCH",
+        "SGLang FP4-aware weight checker",
+    ),
+]
 
-if e8m0_sentinel not in text:
-    old = """            weights = []
-            handles = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
-                    )
-                )
-                weights.append((name, weight))
-            for handle in handles:
-                handle.wait()
-"""
-    new = """            weights = []
-            handles = []
-            e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)  # MILES_E8M0_NCCL_TRANSPORT_PATCH
-            fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)  # MILES_FP4_NCCL_TRANSPORT_PATCH
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                transport_dtype = torch.uint8 if target_dtype == e8m0_dtype else target_dtype
-                weight = torch.empty(shape, dtype=transport_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
-                    )
-                )
-                if transport_dtype != target_dtype:
-                    weight = weight.view(target_dtype)
-                if (
-                    fp4_dtype is not None
-                    and target_dtype in (torch.int8, torch.uint8)
-                    and (
-                        name.endswith(".mlp.experts.w13_weight")
-                        or name.endswith(".mlp.experts.w2_weight")
-                    )
-                ):
-                    weight = weight.view(fp4_dtype)
-                weights.append((name, weight))
-            for handle in handles:
-                handle.wait()
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find SGLang update_weights_from_distributed block in {path}")
-    text = text.replace(old, new)
-    path.write_text(text)
-    print(f"{path}: applied {e8m0_sentinel} and {fp4_sentinel}")
-
-elif fp4_sentinel not in text:
-    old = """            e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)  # MILES_E8M0_NCCL_TRANSPORT_PATCH
-            for name, dtype, shape in zip(names, dtypes, shapes):
-"""
-    new = """            e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)  # MILES_E8M0_NCCL_TRANSPORT_PATCH
-            fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)  # MILES_FP4_NCCL_TRANSPORT_PATCH
-            for name, dtype, shape in zip(names, dtypes, shapes):
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find SGLang e8m0 dtype block in {path}")
-    text = text.replace(old, new)
-
-    old = """                if transport_dtype != target_dtype:
-                    weight = weight.view(target_dtype)
-                weights.append((name, weight))
-"""
-    new = """                if transport_dtype != target_dtype:
-                    weight = weight.view(target_dtype)
-                if (
-                    fp4_dtype is not None
-                    and target_dtype in (torch.int8, torch.uint8)
-                    and (
-                        name.endswith(".mlp.experts.w13_weight")
-                        or name.endswith(".mlp.experts.w2_weight")
-                    )
-                ):
-                    weight = weight.view(fp4_dtype)
-                weights.append((name, weight))
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find SGLang weights append block in {path}")
-    text = text.replace(old, new)
-    path.write_text(text)
-    print(f"{path}: applied {fp4_sentinel}")
-else:
-    print(f"{path}: {e8m0_sentinel} and {fp4_sentinel} already applied")
-
-if bucket_fp4_sentinel not in text:
-    old = """            reconstructed_tensors = bucket.reconstruct_tensors()
-            self.model.load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
-"""
-    new = """            reconstructed_tensors = bucket.reconstruct_tensors()
-            fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)  # MILES_BUCKET_FP4_NCCL_TRANSPORT_PATCH
-            if fp4_dtype is not None:
-                reconstructed_tensors = [
-                    (
-                        name,
-                        tensor.view(fp4_dtype)
-                        if (
-                            tensor.dtype in (torch.int8, torch.uint8)
-                            and (
-                                name.endswith(".mlp.experts.w13_weight")
-                                or name.endswith(".mlp.experts.w2_weight")
-                            )
-                        )
-                        else tensor,
-                    )
-                    for name, tensor in reconstructed_tensors
-                ]
-            self.model.load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find SGLang bucketed NCCL load block in {path}")
-    text = text.replace(old, new)
-
-    old = """        # Load the reconstructed tensors using the standard method
-        self.model.load_weights(reconstructed_tensors)
-
-        return True, "Success"
-"""
-    new = """        # Load the reconstructed tensors using the standard method
-        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)  # MILES_BUCKET_FP4_NCCL_TRANSPORT_PATCH
-        if fp4_dtype is not None:
-            reconstructed_tensors = [
-                (
-                    name,
-                    tensor.view(fp4_dtype)
-                    if (
-                        tensor.dtype in (torch.int8, torch.uint8)
-                        and (
-                            name.endswith(".mlp.experts.w13_weight")
-                            or name.endswith(".mlp.experts.w2_weight")
-                        )
-                    )
-                    else tensor,
-                )
-                for name, tensor in reconstructed_tensors
-            ]
-        self.model.load_weights(reconstructed_tensors)
-
-        return True, "Success"
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find SGLang tensor bucket load block in {path}")
-    text = text.replace(old, new)
-    path.write_text(text)
-    print(f"{path}: applied {bucket_fp4_sentinel}")
-else:
-    print(f"{path}: {bucket_fp4_sentinel} already applied")
-
-if ffn_fp4_sentinel not in text:
-    old = """                                name.endswith(".mlp.experts.w13_weight")
-                                or name.endswith(".mlp.experts.w2_weight")
-"""
-    new = """                                name.endswith(".mlp.experts.w13_weight")
-                                or name.endswith(".mlp.experts.w2_weight")
-                                or name.endswith(".ffn.experts.w13_weight")
-                                or name.endswith(".ffn.experts.w2_weight")  # MILES_FFN_FP4_NCCL_TRANSPORT_PATCH
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find SGLang FP4 expert suffix checks in {path}")
-    text = text.replace(old, new)
-    path.write_text(text)
-    print(f"{path}: applied {ffn_fp4_sentinel}")
-else:
-    print(f"{path}: {ffn_fp4_sentinel} already applied")
-
-if direct_ffn_fp4_sentinel not in text:
-    old = """                        name.endswith(".mlp.experts.w13_weight")
-                        or name.endswith(".mlp.experts.w2_weight")
-                    )
-                ):
-"""
-    new = """                        name.endswith(".mlp.experts.w13_weight")
-                        or name.endswith(".mlp.experts.w2_weight")
-                        or name.endswith(".ffn.experts.w13_weight")
-                        or name.endswith(".ffn.experts.w2_weight")  # MILES_DIRECT_FFN_FP4_NCCL_TRANSPORT_PATCH
-                    )
-                ):
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find SGLang direct FP4 expert suffix checks in {path}")
-    text = text.replace(old, new)
-    path.write_text(text)
-    print(f"{path}: applied {direct_ffn_fp4_sentinel}")
-else:
-    print(f"{path}: {direct_ffn_fp4_sentinel} already applied")
-
-if tensor_bucket_ffn_fp4_sentinel not in text:
-    old = """                            name.endswith(".mlp.experts.w13_weight")
-                            or name.endswith(".mlp.experts.w2_weight")
-                        )
-                    )
-                    else tensor,
-"""
-    new = """                            name.endswith(".mlp.experts.w13_weight")
-                            or name.endswith(".mlp.experts.w2_weight")
-                            or name.endswith(".ffn.experts.w13_weight")
-                            or name.endswith(".ffn.experts.w2_weight")  # MILES_TENSOR_BUCKET_FFN_FP4_NCCL_TRANSPORT_PATCH
-                        )
-                    )
-                    else tensor,
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find SGLang tensor-bucket FP4 expert suffix checks in {path}")
-    text = text.replace(old, new)
-    path.write_text(text)
-    print(f"{path}: applied {tensor_bucket_ffn_fp4_sentinel}")
-else:
-    print(f"{path}: {tensor_bucket_ffn_fp4_sentinel} already applied")
-
-model_path = Path("/sgl-workspace/sglang/python/sglang/srt/models/deepseek_v4.py")
-loader_fp4_sentinel = "MILES_DSV4_LOADER_FP4_EXPERT_VIEW_PATCH"
-model_text = model_path.read_text()
-if loader_fp4_sentinel not in model_text:
-    old = """                    name = self.remap_weight_name_to_dpsk_hf_format(
-                        name,
-                        is_nextn=is_nextn,
-                        num_hidden_layers=self.config.num_hidden_layers,
-                    )
-
-                    layer_id = get_layer_id(name)
-"""
-    new = """                    name = self.remap_weight_name_to_dpsk_hf_format(
-                        name,
-                        is_nextn=is_nextn,
-                        num_hidden_layers=self.config.num_hidden_layers,
-                    )
-
-                    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-                    if (
-                        fp4_dtype is not None
-                        and loaded_weight.dtype in (torch.int8, torch.uint8)
-                        and (
-                            name.endswith(".mlp.experts.w13_weight")
-                            or name.endswith(".mlp.experts.w2_weight")
-                            or name.endswith(".ffn.experts.w13_weight")
-                            or name.endswith(".ffn.experts.w2_weight")
-                        )
-                    ):
-                        loaded_weight = loaded_weight.view(fp4_dtype)  # MILES_DSV4_LOADER_FP4_EXPERT_VIEW_PATCH
-
-                    layer_id = get_layer_id(name)
-"""
-    if old not in model_text:
-        raise RuntimeError(f"Could not find DeepSeek-V4 loader remap block in {model_path}")
-    model_text = model_text.replace(old, new)
-    model_path.write_text(model_text)
-    print(f"{model_path}: applied {loader_fp4_sentinel}")
-else:
-    print(f"{model_path}: {loader_fp4_sentinel} already applied")
-
-fused_moe_path = Path("/sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py")
-fused_moe_fp4_sentinel = "MILES_FUSED_MOE_FP4_EXPERT_COPY_PATCH"
-fused_text = fused_moe_path.read_text()
-if fused_moe_fp4_sentinel not in fused_text:
-    old = """_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-"""
-    new = """_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-
-def _miles_view_fp4_payload_if_needed(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    if (
-        fp4_dtype is not None
-        and dst.dtype == fp4_dtype
-        and src.dtype in (torch.int8, torch.uint8)
-    ):
-        return src.view(fp4_dtype)
-    return src
-
-# MILES_FUSED_MOE_FP4_EXPERT_COPY_PATCH
-"""
-    if old not in fused_text:
-        raise RuntimeError(f"Could not find SGLang fused MoE globals in {fused_moe_path}")
-    fused_text = fused_text.replace(old, new, 1)
-
-    old = "expert_data.copy_(loaded_weight)"
-    new = "expert_data.copy_(_miles_view_fp4_payload_if_needed(expert_data, loaded_weight))"
-    if old not in fused_text:
-        raise RuntimeError(f"Could not find SGLang fused MoE expert copy sites in {fused_moe_path}")
-    fused_text = fused_text.replace(old, new)
-
-    old = "param.data[:, :dim1, :dim2].copy_(loaded_weight)"
-    new = (
-        "param.data[:, :dim1, :dim2].copy_("
-        "_miles_view_fp4_payload_if_needed(param.data[:, :dim1, :dim2], loaded_weight)"
-        ")"
-    )
-    if old not in fused_text:
-        raise RuntimeError(f"Could not find SGLang fused MoE static FP4 copy sites in {fused_moe_path}")
-    fused_text = fused_text.replace(old, new)
-
-    fused_moe_path.write_text(fused_text)
-    print(f"{fused_moe_path}: applied {fused_moe_fp4_sentinel}")
-else:
-    print(f"{fused_moe_path}: {fused_moe_fp4_sentinel} already applied")
-'''
-    with _without_ray_address():
-        U.exec_command_all_ray_node(f"python3 - <<'PY'\n{patch_code}\nPY", num_nodes=args.num_nodes)
-
-
-def _patch_megatron_skip_grad_norm_when_unclipped_all_nodes(args: ScriptArgs) -> None:
-    # TE's fused multi-tensor l2norm has produced HIP memory faults on MI355
-    # during DSV4 Flash bringup. With --clip-grad 0.0, ChainedOptimizer should
-    # not need grad norm, so skip that fused path completely.
-    patch_code = r'''
-from pathlib import Path
-
-path = Path("/root/Megatron-LM/megatron/core/optimizer/optimizer.py")
-sentinel = "MILES_SKIP_CHAINED_GRAD_NORM_WHEN_UNCLIPPED"
-text = path.read_text()
-if sentinel in text:
-    print(f"{path}: {sentinel} already applied")
-else:
-    old = """        grad_norm = self.get_grad_norm()
-
-        # Clip gradients.
-"""
-    new = """        should_compute_grad_norm = any(
-            not (hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer)
-            and optimizer.config.clip_grad > 0.0
-            for optimizer in self.chained_optimizers
-        )
-        grad_norm = self.get_grad_norm() if should_compute_grad_norm else 0.0
-
-        # Clip gradients.  # MILES_SKIP_CHAINED_GRAD_NORM_WHEN_UNCLIPPED
-"""
-    if old not in text:
-        raise RuntimeError(f"Could not find ChainedOptimizer grad_norm block in {path}")
-    text = text.replace(old, new, 1)
-    path.write_text(text)
-    print(f"{path}: applied {sentinel}")
-'''
-    with _without_ray_address():
-        U.exec_command_all_ray_node(f"python3 - <<'PY'\n{patch_code}\nPY", num_nodes=args.num_nodes)
-
-
-def _patch_te_fused_adam_chunked_step_all_nodes(args: ScriptArgs) -> None:
-    # TE's precision-aware Adam unscales fp8/fp16 optimizer states for the
-    # whole parameter group before launching the fused update. DSV4 Flash fits
-    # the persistent state on one MI355 node, but the full-group fp32 scratch
-    # list leaves no headroom. Chunking preserves one optimizer step while
-    # keeping the transient fp32 state bounded.
-    patch_code = r'''
-from pathlib import Path
-
-path = Path("/opt/venv/lib/python3.10/site-packages/transformer_engine/pytorch/optimizers/fused_adam.py")
-sentinel = "MILES_TE_FUSED_ADAM_CHUNKED_STEP_PATCH"
-text = path.read_text()
-if sentinel in text:
-    print(f"{path}: {sentinel} already applied")
-else:
-    patch = r"""
-
-# MILES_TE_FUSED_ADAM_CHUNKED_STEP_PATCH
-_MILES_ORIG_FUSED_ADAM_STEP = FusedAdam.step
-
-
-def _miles_clone_step_value(value):
-    if value is None:
-        return None
-    if isinstance(value, torch.Tensor):
-        return value.clone()
-    return value
-
-
-def _miles_restore_step(group, had_step, value):
-    if had_step:
-        group["step"] = _miles_clone_step_value(value)
-    else:
-        group.pop("step", None)
-
-
-def _miles_param_chunks(params, target_elems):
-    chunk = []
-    elems = 0
-    for param in params:
-        param_elems = int(param.numel()) if hasattr(param, "numel") else 0
-        if chunk and elems + param_elems > target_elems:
-            yield chunk
-            chunk = []
-            elems = 0
-        chunk.append(param)
-        elems += param_elems
-    if chunk:
-        yield chunk
-
-
-def _miles_chunked_fused_adam_step(self, closure=None, grad_scaler=None):
-    import os
-
-    target_elems = int(os.environ.get("MILES_TE_ADAM_CHUNK_ELEMS", "16000000"))
-    if target_elems <= 0:
-        return _MILES_ORIG_FUSED_ADAM_STEP(self, closure=closure, grad_scaler=grad_scaler)
-
-    loss = closure() if closure is not None else None
-    original_groups = self.param_groups
-    original_params = {id(group): list(group["params"]) for group in original_groups}
+missing = []
+for filename, sentinel, label in checks:
+    path = Path(filename)
     try:
-        for group in original_groups:
-            params = original_params[id(group)]
-            if not params:
-                continue
+        text = path.read_text()
+    except OSError as exc:
+        missing.append(f"{label}: cannot read {filename}: {exc}")
+        continue
+    if sentinel not in text:
+        missing.append(f"{label}: missing {sentinel} in {filename}")
 
-            had_step = "step" in group
-            step_before = _miles_clone_step_value(group.get("step"))
-            chunks = list(_miles_param_chunks(params, target_elems))
-            if len(chunks) <= 1:
-                self.param_groups = [group]
-                _miles_restore_step(group, had_step, step_before)
-                _MILES_ORIG_FUSED_ADAM_STEP(self, closure=None, grad_scaler=grad_scaler)
-                continue
+if missing:
+    details = "\n".join(f"  - {item}" for item in missing)
+    raise RuntimeError(
+        "This container is missing DeepSeek-V4-Flash build-time patches. "
+        "Rebuild from miles/docker/Dockerfile.rocm_MI350-5_DSV4 on every node.\n"
+        + details
+    )
 
-            for chunk in chunks:
-                group["params"] = chunk
-                self.param_groups = [group]
-                _miles_restore_step(group, had_step, step_before)
-                _MILES_ORIG_FUSED_ADAM_STEP(self, closure=None, grad_scaler=grad_scaler)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            group["params"] = params
-    finally:
-        self.param_groups = original_groups
-        for group in original_groups:
-            group["params"] = original_params[id(group)]
-    return loss
-
-
-FusedAdam.step = _miles_chunked_fused_adam_step
-"""
-    text = text + patch
-    path.write_text(text)
-    print(f"{path}: applied {sentinel}")
+print("DeepSeek-V4-Flash build-time patches verified")
 '''
     with _without_ray_address():
-        U.exec_command_all_ray_node(f"python3 - <<'PY'\n{patch_code}\nPY", num_nodes=args.num_nodes)
+        U.exec_command_all_ray_node(f"python3 - <<'PY'\n{check_code}\nPY", num_nodes=args.num_nodes)
 
 
 def _prepare(args: ScriptArgs) -> None:
@@ -713,9 +312,7 @@ def _prepare(args: ScriptArgs) -> None:
     with _without_ray_address():
         U.exec_command_all_ray_node(f"mkdir -p {args.model_dir} {args.data_dir}", num_nodes=args.num_nodes)
 
-    _patch_sglang_e8m0_nccl_transport_all_nodes(args)
-    _patch_megatron_skip_grad_norm_when_unclipped_all_nodes(args)
-    _patch_te_fused_adam_chunked_step_all_nodes(args)
+    _verify_container_runtime_patches(args)
 
     if args.download_model:
         local_checkpoint = Path(args.model_dir) / args.model_name
@@ -1078,7 +675,7 @@ def _extra_env(args: ScriptArgs) -> dict[str, str]:
     visible_devices = ",".join(str(i) for i in range(args.num_gpus_per_node))
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
     no_proxy = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or f"localhost,127.0.0.1,0.0.0.0,{master_addr}"
-    return {
+    env = {
         "PYTHONPATH": pythonpath,
         "MASTER_ADDR": master_addr,
         "no_proxy": no_proxy,
@@ -1139,6 +736,7 @@ def _extra_env(args: ScriptArgs) -> dict[str, str]:
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "RAY_DEDUP_LOGS": "0",
     }
+    return env
 
 
 @U.dataclass_cli
