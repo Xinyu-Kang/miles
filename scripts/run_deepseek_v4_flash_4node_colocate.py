@@ -20,13 +20,13 @@ class ScriptArgs(U.ExecuteTrainConfig):
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = U.create_run_id()
 
-    # This launcher is for a colocated 2-node bringup:
-    #   two nodes worth of GPUs are shared by Megatron actor and SGLang rollout.
+    # This launcher is for a colocated 4-node bringup:
+    #   four nodes worth of GPUs are shared by Megatron actor and SGLang rollout.
     # Miles colocate is synchronous (`train.py`); `train_async.py` explicitly
     # rejects --colocate.
-    num_nodes: int = 2
-    actor_num_nodes: int = 2
-    rollout_num_nodes: int = 2
+    num_nodes: int = 4
+    actor_num_nodes: int = 4
+    rollout_num_nodes: int = 4
 
     hf_checkpoint: str = "deepseek-ai/DeepSeek-V4-Flash"
     model_org: str = "deepseek-ai"
@@ -56,12 +56,17 @@ class ScriptArgs(U.ExecuteTrainConfig):
     use_tis: bool = False
 
     accumulate_allreduce_grads_in_fp32: bool = False
-    train_memory_margin_bytes: int = 2 * 1024 * 1024 * 1024
+    # Keep enough slack for ROCm allocator spikes without artificially
+    # recreating the 2-node optimizer-margin OOM.
+    train_memory_margin_bytes: int = 16 * 1024 * 1024 * 1024
     offload_train: bool = True
     offload_rollout: bool = True
     offload_rollout_level: str = "kv_cache weight"
     optimizer: Literal["adam", "sgd"] = "adam"
-    precision_aware_optimizer: bool = True
+    # ROCm7 precision-aware Adam currently trips HSA memory faults in this DSV4
+    # path. The 4-node script instead relies on DP=4 plus optimizer-state
+    # offload to keep non-precision-aware Adam within memory.
+    precision_aware_optimizer: bool = False
     main_params_dtype: Literal["fp16", "fp32"] = "fp32"
     optimizer_state_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
     tensor_model_parallel_size: int = 8
@@ -80,7 +85,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     enable_eval: bool = False
     wait_for_ray_gpus: bool = True
     ray_wait_timeout_secs: int = 900
-    extra_args: str = ""
+    extra_args: str = "--offload-optimizer-states"
 
 
 def _pick(args: ScriptArgs, name: str, debug_value, normal_value):
@@ -504,19 +509,19 @@ def _resolve_aiter_config(args: ScriptArgs) -> str:
 
 
 def _validate_layout(args: ScriptArgs) -> None:
-    if args.num_nodes != 2:
-        raise ValueError("This launcher is intentionally scoped to exactly 2 Ray nodes.")
-    if args.actor_num_nodes != 2 or args.rollout_num_nodes != 2:
-        raise ValueError("This colocate launcher expects actor and rollout to share both nodes.")
+    if args.num_nodes != 4:
+        raise ValueError("This launcher is intentionally scoped to exactly 4 Ray nodes.")
+    if args.actor_num_nodes != 4 or args.rollout_num_nodes != 4:
+        raise ValueError("This colocate launcher expects actor and rollout to share all four nodes.")
     if args.num_gpus_per_node != 8:
-        raise ValueError("DeepSeek-V4-Flash MI355 2-node colocate bringup expects exactly 8 GPUs per node.")
+        raise ValueError("DeepSeek-V4-Flash MI355 4-node colocate bringup expects exactly 8 GPUs per node.")
     if os.environ.get("MILES_SCRIPT_EXTERNAL_RAY") != "1":
         raise ValueError(
-            "Two-node runs must use an already-running Ray cluster. Start Ray on both nodes, "
+            "Four-node runs must use an already-running Ray cluster. Start Ray on all nodes, "
             "then run this launcher on the head with MILES_SCRIPT_EXTERNAL_RAY=1."
         )
     if args.update_weight_transfer_mode != "broadcast":
-        raise ValueError("AMD MI355 2-node colocate bringup uses NCCL broadcast weight sync only.")
+        raise ValueError("AMD MI355 4-node colocate bringup uses NCCL broadcast weight sync only.")
     bad_levels = set(args.offload_rollout_level.split()) - {"kv_cache", "weight"}
     if bad_levels:
         raise ValueError(f"Unsupported offload_rollout_level entries: {sorted(bad_levels)}")
@@ -524,7 +529,7 @@ def _validate_layout(args: ScriptArgs) -> None:
     if args.pipeline_model_parallel_size != 1:
         raise ValueError(
             "ROCm7 DeepSeek-V4-Flash Megatron PP>1 currently gives incorrect train/rollout logprobs. "
-            "Use pipeline_model_parallel_size=1 for the 2-node correctness path."
+            "Use pipeline_model_parallel_size=1 for the 4-node correctness path."
         )
     train_world_size = args.actor_num_nodes * args.num_gpus_per_node
     model_parallel_size = (
@@ -614,7 +619,7 @@ def _execute(args: ScriptArgs) -> None:
         ckpt_args += f"--save {load_save_path} --save-interval 20 --save-retain-interval 20 "
 
     num_rollout = _pick(args, "num_rollout", 1, 300)
-    rollout_batch_size = _pick(args, "rollout_batch_size", 2, 4)
+    rollout_batch_size = _pick(args, "rollout_batch_size", 4, 4)
     n_samples = _pick(args, "n_samples_per_prompt", 1, 4)
     response_len = _pick(args, "rollout_max_response_len", 64, 4096)
     num_steps = _pick(args, "num_steps_per_rollout", 1, 1)
@@ -799,6 +804,14 @@ def _execute(args: ScriptArgs) -> None:
     if args.accumulate_allreduce_grads_in_fp32:
         misc_args += "--accumulate-allreduce-grads-in-fp32 "
 
+    extra_args = args.extra_args
+    if (
+        args.optimizer == "adam"
+        and not args.precision_aware_optimizer
+        and "--offload-optimizer-states" not in extra_args
+    ):
+        extra_args = f"{extra_args} --offload-optimizer-states".strip()
+
     train_args = (
         f"{ckpt_args} "
         f"{rollout_args} "
@@ -809,7 +822,7 @@ def _execute(args: ScriptArgs) -> None:
         f"{eval_args} "
         f"{sglang_args} "
         f"{misc_args} "
-        f"{args.extra_args} "
+        f"{extra_args} "
     )
 
     U.execute_train(

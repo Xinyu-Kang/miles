@@ -312,6 +312,8 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
     def onload_weights(self):
+        if self.server_groups and "weight" not in self.server_groups[0].args.offload_rollout_level:
+            return []
         handles = []
         for g in self.server_groups:
             if not g.needs_offload:

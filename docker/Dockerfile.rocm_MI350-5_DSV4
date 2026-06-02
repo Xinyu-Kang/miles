@@ -112,11 +112,14 @@ RUN pip install git+${TORCH_MEMORY_SAVER_REPO}@${TORCH_MEMORY_SAVER_COMMIT} --no
 RUN rm -rf /usr/lib/python3/dist-packages/jwt /usr/lib/python3/dist-packages/PyJWT* && \
     pip install -r /tmp/requirements.txt
 
-# Ray/CLI pins: miles-dsv4-fixed match
-RUN pip install "ray[default]==2.55.1" "typer==0.25.1" "click==8.3.3"
+# Ray/CLI pins: keep Click compatible with the bundled huggingface-hub metadata.
+RUN pip install "ray[default]==2.55.1" "typer==0.25.1" "click==8.4.1"
 
 # numpy 1.x: Megatron compat
 RUN pip install "numpy<2"
+
+# Torch 2.9.0 ROCm 7.0 expects newer Triton metadata than this custom Triton exposes.
+RUN python -c 'from pathlib import Path; p=Path("/opt/venv/lib/python3.10/site-packages/torch/_inductor/runtime/triton_heuristics.py"); s=p.read_text(); old="(binary.metadata.num_ctas, *binary.metadata.cluster_dims)"; new="(binary.metadata.num_ctas, *getattr(binary.metadata, \"cluster_dims\", ()))"; assert old in s or new in s; p.write_text(s.replace(old, new))'
 
 # ====================================== Runtime package checks ==========================================
 

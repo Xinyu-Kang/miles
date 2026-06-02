@@ -23,7 +23,7 @@ async def train(args):
     # create the actor and critic models
     actor_model, critic_model = await create_training_models(args, pgs, rollout_manager)
 
-    if args.offload_rollout:
+    if args.offload_rollout and "weight" in args.offload_rollout_level:
         await rollout_manager.onload_weights.remote()
 
     # always update weight first so that sglang has the loaded weights from training.
@@ -32,7 +32,7 @@ async def train(args):
     if args.check_weight_update_equal:
         await rollout_manager.check_weights.remote(action="compare")
 
-    if args.offload_rollout:
+    if args.offload_rollout and "kv_cache" in args.offload_rollout_level:
         await rollout_manager.onload_kv.remote()
 
     # special case for eval-only
@@ -92,10 +92,10 @@ async def train(args):
             await save(rollout_id)
 
         await offload_train()
-        if args.offload_rollout:
+        if args.offload_rollout and "weight" in args.offload_rollout_level:
             await rollout_manager.onload_weights.remote()
         await actor_model.update_weights()
-        if args.offload_rollout:
+        if args.offload_rollout and "kv_cache" in args.offload_rollout_level:
             await rollout_manager.onload_kv.remote()
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):

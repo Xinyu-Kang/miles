@@ -609,12 +609,19 @@ def _compute_server_args(
     node_rank = rank % nnodes
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
+    offload_rollout_level = args.offload_rollout_level
+    if isinstance(offload_rollout_level, str):
+        offload_rollout_level = offload_rollout_level.split()
+
     kwargs = {
         "model_path": args.hf_checkpoint,
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
         "enable_memory_saver": args.offload_rollout,
+        "enable_weights_cpu_backup": (
+            args.offload_rollout and "weight" in offload_rollout_level
+        ),
         # distributed
         "host": host,
         "port": port,
