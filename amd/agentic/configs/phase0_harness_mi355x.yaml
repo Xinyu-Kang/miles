@@ -1,0 +1,48 @@
+{
+  "schema_version": "1.0",
+  "name": "phase0-harness-mi355x",
+  "kind": "qualification",
+  "enabled": true,
+  "container": {
+    "image_ref": "rocm/sgl-dev:miles-rocm720-mi35x-20260722",
+    "image_digest": "sha256:e3ef5fb396105b4e510ae54c2cea80c6e0086b40876539576ffa2f669b37098f"
+  },
+  "expected": {
+    "miles_revision": "",
+    "allow_dirty": false,
+    "require_image_digest": true,
+    "gpu_count": 8,
+    "gpu_arch": "gfx950"
+  },
+  "assets": [
+    {
+      "name": "deterministic-two-tool-trajectory",
+      "kind": "qualification-fixture",
+      "path": "amd/agentic/tests/fixtures/two_tool_trajectory.json",
+      "sha256": "b83c5a6558bb33d5f7b2b2765fd38e9b5c6c865264b7b81287475eddb92783b8",
+      "verify_content_sha256": true,
+      "required": true
+    }
+  ],
+  "environment_allowlist": [
+    "HF_HOME",
+    "HSA_ENABLE_IPC_MODE_LEGACY",
+    "PYTHONPATH",
+    "SGLANG_USE_AITER"
+  ],
+  "services": [],
+  "launch": {
+    "arguments": [
+      "--repeat",
+      "100"
+    ],
+    "command": [
+      "python",
+      "-m",
+      "amd.agentic.tools.validate_trajectory",
+      "amd/agentic/tests/fixtures/two_tool_trajectory.json",
+      "--repeat",
+      "100"
+    ]
+  }
+}

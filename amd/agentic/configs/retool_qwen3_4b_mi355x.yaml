@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0",
+  "name": "retool-qwen3-4b-mi355x",
+  "kind": "retool",
+  "enabled": false,
+  "container": {
+    "image_ref": "rocm/sgl-dev:miles-rocm720-mi35x-20260722",
+    "image_digest": "sha256:e3ef5fb396105b4e510ae54c2cea80c6e0086b40876539576ffa2f669b37098f"
+  },
+  "expected": {
+    "miles_revision": "",
+    "allow_dirty": false,
+    "require_image_digest": true,
+    "gpu_count": 8,
+    "gpu_arch": "gfx950"
+  },
+  "assets": [
+    {
+      "name": "qwen3-4b-hf",
+      "kind": "model",
+      "path": "/workspace/artifacts/models/Qwen3-4B",
+      "revision": "",
+      "required": true
+    },
+    {
+      "name": "qwen3-4b-torch-dist",
+      "kind": "checkpoint",
+      "path": "/workspace/artifacts/models/Qwen3-4B_torch_dist",
+      "revision": "",
+      "required": true
+    },
+    {
+      "name": "dapo-math-17k",
+      "kind": "dataset",
+      "path": "/workspace/artifacts/datasets/dapo-math-17k",
+      "revision": "",
+      "required": true
+    }
+  ],
+  "environment_allowlist": [
+    "AITER_ROOT_DIR",
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "HF_HOME",
+    "HSA_ENABLE_IPC_MODE_LEGACY",
+    "MILES_CONTAINER_IMAGE",
+    "MILES_CONTAINER_IMAGE_DIGEST",
+    "PYTHONPATH",
+    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
+    "SGLANG_USE_AITER"
+  ],
+  "services": [],
+  "launch": {
+    "arguments": [],
+    "command": []
+  }
+}

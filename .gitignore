@@ -194,3 +194,7 @@ _examples_synced/
 .DS_Store
 
 .humanize/
+
+# AMD agentic qualification bundles can contain large or sensitive run data.
+amd/agentic/results/*
+!amd/agentic/results/README.md

@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amd.com/miles/agentic/manifest.schema.json",
+  "title": "AMD Miles agentic qualification manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "created_at",
+    "workload",
+    "source",
+    "container",
+    "runtime",
+    "gpus",
+    "assets",
+    "launch",
+    "environment",
+    "services",
+    "qualification"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "workload": {
+      "type": "object",
+      "required": [
+        "name",
+        "kind",
+        "enabled"
+      ],
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "repo_root",
+        "commit",
+        "branch",
+        "dirty",
+        "status_lines",
+        "tracked_patch",
+        "tracked_patch_sha256",
+        "tracked_patch_truncated",
+        "remotes"
+      ],
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "status_lines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "container": {
+      "type": "object",
+      "required": [
+        "image_ref",
+        "image_digest"
+      ],
+      "properties": {
+        "image_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image_digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "python",
+        "python_implementation",
+        "platform",
+        "executable",
+        "packages",
+        "rocm_version"
+      ]
+    },
+    "gpus": {
+      "type": "object",
+      "required": [
+        "count",
+        "architectures",
+        "devices",
+        "collector_error"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "architectures": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^gfx"
+          }
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "path",
+          "required",
+          "declared_revision",
+          "declared_sha256",
+          "exists",
+          "type"
+        ]
+      }
+    },
+    "launch": {
+      "type": "object",
+      "required": [
+        "config_path",
+        "arguments",
+        "command"
+      ]
+    },
+    "environment": {
+      "type": "object"
+    },
+    "services": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "url",
+          "required",
+          "status",
+          "healthy",
+          "latency_ms",
+          "error"
+        ]
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "required": [
+        "passed",
+        "errors",
+        "warnings"
+      ],
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/issue"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/issue"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "issue": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

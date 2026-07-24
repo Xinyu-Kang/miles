@@ -1,0 +1,196 @@
+{
+  "schema_version": "1.0",
+  "trajectory_id": "deterministic-two-tool-0001",
+  "status": "completed",
+  "initial_input_ids": [
+    101,
+    102,
+    103
+  ],
+  "turn_count": 3,
+  "tool_call_count": 2,
+  "events": [
+    {
+      "kind": "generation",
+      "sequence": 0,
+      "timestamp": 1.0,
+      "turn": 0,
+      "input_ids": [
+        101,
+        102,
+        103
+      ],
+      "output_ids": [
+        201,
+        202
+      ],
+      "generated_token_count": 2,
+      "loss_mask": [
+        1,
+        1
+      ],
+      "logprobs": [
+        -0.1,
+        -0.2
+      ],
+      "finish_reason": "tool_call"
+    },
+    {
+      "kind": "observation",
+      "sequence": 1,
+      "timestamp": 2.0,
+      "turn": 0,
+      "token_ids": [
+        301,
+        302,
+        303
+      ],
+      "loss_mask": [
+        0,
+        0,
+        0
+      ],
+      "logprobs": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "kind": "generation",
+      "sequence": 2,
+      "timestamp": 3.0,
+      "turn": 1,
+      "input_ids": [
+        101,
+        102,
+        103,
+        201,
+        202,
+        301,
+        302,
+        303
+      ],
+      "output_ids": [
+        203
+      ],
+      "generated_token_count": 1,
+      "loss_mask": [
+        1
+      ],
+      "logprobs": [
+        -0.3
+      ],
+      "finish_reason": "tool_call"
+    },
+    {
+      "kind": "observation",
+      "sequence": 3,
+      "timestamp": 4.0,
+      "turn": 1,
+      "token_ids": [
+        304,
+        305
+      ],
+      "loss_mask": [
+        0,
+        0
+      ],
+      "logprobs": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "kind": "generation",
+      "sequence": 4,
+      "timestamp": 5.0,
+      "turn": 2,
+      "input_ids": [
+        101,
+        102,
+        103,
+        201,
+        202,
+        301,
+        302,
+        303,
+        203,
+        304,
+        305
+      ],
+      "output_ids": [
+        204,
+        205
+      ],
+      "generated_token_count": 2,
+      "loss_mask": [
+        1,
+        1
+      ],
+      "logprobs": [
+        -0.4,
+        -0.5
+      ],
+      "finish_reason": "stop"
+    },
+    {
+      "kind": "finalize",
+      "sequence": 5,
+      "timestamp": 6.0
+    },
+    {
+      "kind": "delete",
+      "sequence": 6,
+      "timestamp": 7.0
+    }
+  ],
+  "lifecycle": {
+    "requires_finalize": true,
+    "requires_delete": true,
+    "finalized": true,
+    "deleted": true
+  },
+  "assembled": {
+    "tokens": [
+      101,
+      102,
+      103,
+      201,
+      202,
+      301,
+      302,
+      303,
+      203,
+      304,
+      305,
+      204,
+      205
+    ],
+    "response_length": 10,
+    "loss_mask": [
+      1,
+      1,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      1,
+      1
+    ],
+    "rollout_log_probs": [
+      -0.1,
+      -0.2,
+      0.0,
+      0.0,
+      0.0,
+      -0.3,
+      0.0,
+      0.0,
+      -0.4,
+      -0.5
+    ]
+  }
+}

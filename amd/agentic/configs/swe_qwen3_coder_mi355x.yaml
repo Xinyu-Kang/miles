@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0",
+  "name": "swe-qwen3-coder-mi355x",
+  "kind": "swe",
+  "enabled": false,
+  "container": {
+    "image_ref": "rocm/sgl-dev:miles-rocm720-mi35x-20260722",
+    "image_digest": "sha256:e3ef5fb396105b4e510ae54c2cea80c6e0086b40876539576ffa2f669b37098f"
+  },
+  "expected": {
+    "miles_revision": "",
+    "allow_dirty": false,
+    "require_image_digest": true,
+    "gpu_count": 8,
+    "gpu_arch": "gfx950"
+  },
+  "assets": [
+    {
+      "name": "qwen3-coder-hf",
+      "kind": "model",
+      "path": "/workspace/artifacts/models/Qwen3-Coder-30B-A3B-Instruct",
+      "revision": "",
+      "required": true
+    },
+    {
+      "name": "qwen3-coder-torch-dist",
+      "kind": "checkpoint",
+      "path": "/workspace/artifacts/models/Qwen3-Coder-30B-A3B-Instruct_torch_dist",
+      "revision": "",
+      "required": true
+    },
+    {
+      "name": "harbor-tasks",
+      "kind": "dataset",
+      "path": "/workspace/artifacts/datasets/harbor_tasks",
+      "revision": "",
+      "required": true
+    }
+  ],
+  "environment_allowlist": [
+    "CUDA_VISIBLE_DEVICES",
+    "HARBOR_TASKS_DIR",
+    "HF_HOME",
+    "HIP_VISIBLE_DEVICES",
+    "HSA_ENABLE_IPC_MODE_LEGACY",
+    "PYTHONPATH",
+    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
+    "SGLANG_USE_AITER"
+  ],
+  "services": [
+    {
+      "name": "harbor-agent-server",
+      "url": "http://127.0.0.1:8000/health",
+      "method": "GET",
+      "timeout_seconds": 3,
+      "required": true
+    }
+  ],
+  "launch": {
+    "arguments": [],
+    "command": []
+  }
+}

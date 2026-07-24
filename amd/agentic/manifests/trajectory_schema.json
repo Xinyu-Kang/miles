@@ -1,0 +1,269 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amd.com/miles/agentic/trajectory.schema.json",
+  "title": "AMD Miles exact-token agentic trajectory",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trajectory_id",
+    "status",
+    "initial_input_ids",
+    "turn_count",
+    "tool_call_count",
+    "events",
+    "lifecycle",
+    "assembled"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "trajectory_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "truncated",
+        "aborted",
+        "failed"
+      ]
+    },
+    "initial_input_ids": {
+      "$ref": "#/$defs/token_ids"
+    },
+    "turn_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tool_call_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/generation"
+          },
+          {
+            "$ref": "#/$defs/observation"
+          },
+          {
+            "$ref": "#/$defs/finalize"
+          },
+          {
+            "$ref": "#/$defs/delete"
+          }
+        ]
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "required": [
+        "requires_finalize",
+        "requires_delete",
+        "finalized",
+        "deleted"
+      ],
+      "properties": {
+        "requires_finalize": {
+          "type": "boolean"
+        },
+        "requires_delete": {
+          "type": "boolean"
+        },
+        "finalized": {
+          "type": "boolean"
+        },
+        "deleted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "assembled": {
+      "type": "object",
+      "required": [
+        "tokens",
+        "response_length",
+        "loss_mask",
+        "rollout_log_probs"
+      ],
+      "properties": {
+        "tokens": {
+          "$ref": "#/$defs/token_ids"
+        },
+        "response_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "loss_mask": {
+          "$ref": "#/$defs/mask"
+        },
+        "rollout_log_probs": {
+          "$ref": "#/$defs/logprobs"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "base_event": {
+      "type": "object",
+      "required": [
+        "kind",
+        "sequence",
+        "timestamp"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timestamp": {
+          "type": "number"
+        }
+      }
+    },
+    "generation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base_event"
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "turn",
+            "input_ids",
+            "output_ids",
+            "generated_token_count",
+            "loss_mask",
+            "logprobs",
+            "finish_reason"
+          ],
+          "properties": {
+            "kind": {
+              "const": "generation"
+            },
+            "turn": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "input_ids": {
+              "$ref": "#/$defs/token_ids"
+            },
+            "output_ids": {
+              "$ref": "#/$defs/token_ids"
+            },
+            "generated_token_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "loss_mask": {
+              "$ref": "#/$defs/mask"
+            },
+            "logprobs": {
+              "$ref": "#/$defs/logprobs"
+            },
+            "finish_reason": {
+              "enum": [
+                "stop",
+                "length",
+                "abort",
+                "tool_call"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "observation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base_event"
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "turn",
+            "token_ids",
+            "loss_mask",
+            "logprobs"
+          ],
+          "properties": {
+            "kind": {
+              "const": "observation"
+            },
+            "turn": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "token_ids": {
+              "$ref": "#/$defs/token_ids"
+            },
+            "loss_mask": {
+              "$ref": "#/$defs/mask"
+            },
+            "logprobs": {
+              "$ref": "#/$defs/logprobs"
+            }
+          }
+        }
+      ]
+    },
+    "finalize": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base_event"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "finalize"
+            }
+          }
+        }
+      ]
+    },
+    "delete": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base_event"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "delete"
+            }
+          }
+        }
+      ]
+    },
+    "token_ids": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      }
+    },
+    "mask": {
+      "type": "array",
+      "items": {
+        "enum": [
+          0,
+          1
+        ]
+      }
+    },
+    "logprobs": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      }
+    }
+  }
+}
