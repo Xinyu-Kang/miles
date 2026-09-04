@@ -259,3 +259,10 @@ Preserved failed-attempt artifacts:
 
 - `/workspace/logprob-debug-artifacts/qwen3-30b-logprob-baseline-20260903`
 - `/workspace/logprob-debug-artifacts/qwen3-30b-logprob-baseline-attempt2-20260903`
+
+## Controlled fault-injection follow-up
+
+Three clean-to-fault-to-fixed teaching cases were subsequently completed on
+node 072. They are deliberately injected examples, not natural bug claims.
+See [`tutorial/TUTORIAL_RESULTS.md`](tutorial/TUTORIAL_RESULTS.md) for the
+common A/B/C table, repeatability gates, exact artifact paths, and caveats.

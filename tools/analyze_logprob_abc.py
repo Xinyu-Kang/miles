@@ -443,7 +443,11 @@ def main() -> None:
 
     token_rows, summary = analyze(args.dump_details, args.rollout_id)
     write_outputs(args.output_dir, token_rows, summary)
-    print(json.dumps(summary["comparisons"], indent=2, sort_keys=True))
+    headline = {
+        name: summary["comparisons"][name]["overall"]
+        for name in _COMPARISON_NAMES
+    }
+    print(json.dumps(headline, indent=2, sort_keys=True))
     print(f"Wrote {args.output_dir / 'tokens.csv'}")
     print(f"Wrote {args.output_dir / 'summary.json'}")
     print(f"Wrote {args.output_dir / 'summary.md'}")

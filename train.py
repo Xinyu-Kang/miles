@@ -148,7 +148,15 @@ async def train(args):
             await offload_train()
             if args.offload_rollout:
                 await rollout_manager.onload_weights.remote()
-        await actor_model.update_weights(rollout_id=rollout_id)
+        skip_weight_update = False
+        if getattr(args, "debug_skip_rollout_weight_update_at", None) == rollout_id:
+            from experiments.logprob_debug.qwen3_30b_a3b.tutorial.stale_weight_fault import (
+                should_skip_weight_update,
+            )
+
+            skip_weight_update = should_skip_weight_update(args, rollout_id)
+        if not skip_weight_update:
+            await actor_model.update_weights(rollout_id=rollout_id)
         if args.offload_rollout:
             await rollout_manager.onload_kv.remote()
 

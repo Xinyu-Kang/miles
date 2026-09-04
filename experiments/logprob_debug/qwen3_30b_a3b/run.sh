@@ -15,6 +15,7 @@ export GIT_CONFIG_VALUE_0="${REPO_ROOT}"
 VARIANT="${VARIANT:-baseline}"
 RUN_ID="${RUN_ID:-qwen3-30b-logprob-${VARIANT}-$(date -u +%Y%m%d-%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/workspace/logprob-debug-artifacts}"
+DEBUG_EXIT_AFTER_ROLLOUT="${DEBUG_EXIT_AFTER_ROLLOUT:-1}"
 if [[ "${VARIANT}" == "b_worker_diagnostic" ]]; then
   NUM_ROLLOUT="${NUM_ROLLOUT:-1}"
 else
@@ -40,7 +41,7 @@ mkdir -p "${PROVENANCE_DIR}"
 if [[ "${VARIANT}" == "b_worker_diagnostic" ]]; then
   COMMON_ARGS=(
     --num-rollout "${NUM_ROLLOUT}"
-    --debug-exit-after-rollout 1
+    --debug-exit-after-rollout "${DEBUG_EXIT_AFTER_ROLLOUT}"
     --debug-rollout-only
     --rollout-batch-size 1
     --n-samples-per-prompt 1
@@ -57,7 +58,7 @@ if [[ "${VARIANT}" == "b_worker_diagnostic" ]]; then
 else
   COMMON_ARGS=(
     --num-rollout "${NUM_ROLLOUT}"
-    --debug-exit-after-rollout 1
+    --debug-exit-after-rollout "${DEBUG_EXIT_AFTER_ROLLOUT}"
     --rollout-batch-size 4
     --n-samples-per-prompt 2
     --global-batch-size 8
@@ -114,8 +115,12 @@ case "${VARIANT}" in
     ;;
 esac
 
-printf -v EXTRA_ARGS '%q ' "${COMMON_ARGS[@]}" "${VARIANT_ARGS[@]}"
-export RUN_ID OUTPUT_ROOT NUM_ROLLOUT EXTRA_ARGS VARIANT PROVENANCE_DIR
+EXPERIMENT_ARGS=()
+if [[ -n "${MILES_LOGPROB_EXPERIMENT_EXTRA_ARGS:-}" ]]; then
+  read -r -a EXPERIMENT_ARGS <<< "${MILES_LOGPROB_EXPERIMENT_EXTRA_ARGS}"
+fi
+printf -v EXTRA_ARGS '%q ' "${COMMON_ARGS[@]}" "${VARIANT_ARGS[@]}" "${EXPERIMENT_ARGS[@]}"
+export RUN_ID OUTPUT_ROOT NUM_ROLLOUT DEBUG_EXIT_AFTER_ROLLOUT EXTRA_ARGS VARIANT PROVENANCE_DIR
 export WANDB_API_KEY=""
 export SGLANG_RETURN_ORIGINAL_LOGPROB=1
 export NCCL_IB_GID_INDEX=1
@@ -125,6 +130,11 @@ export NCCL_SOCKET_IFNAME=ens3
 export TP_SOCKET_IFNAME=ens3
 export NCCL_DMABUF_ENABLE=1
 RUNTIME_EXTRA_ENV='{"SGLANG_RETURN_ORIGINAL_LOGPROB":"1","NCCL_IB_GID_INDEX":"1","NCCL_IB_HCA":"ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7","GLOO_SOCKET_IFNAME":"ens3","NCCL_SOCKET_IFNAME":"ens3","TP_SOCKET_IFNAME":"ens3","NCCL_DMABUF_ENABLE":"1"}'
+if [[ -n "${MILES_LOGPROB_EXPERIMENT_RUNTIME_ENV_JSON:-}" ]]; then
+  RUNTIME_EXTRA_ENV="$(python experiments/logprob_debug/qwen3_30b_a3b/tutorial/fault_guard.py \
+    merge-runtime-env "${RUNTIME_EXTRA_ENV}" "${MILES_LOGPROB_EXPERIMENT_RUNTIME_ENV_JSON}")"
+fi
+
 if [[ "${VARIANT}" == "b_worker_diagnostic" ]]; then
   DIAGNOSTIC_SAMPLE_PATH="${DIAGNOSTIC_SAMPLE_PATH:-/workspace/logprob-debug-artifacts/qwen3-30b-logprob-fresh-node-107722-20260903/dump_details/rollout_data/0.pt}"
   DIAGNOSTIC_OUTPUT_PATH="${RUN_DIR}/b_worker_diagnostic.json"
@@ -340,7 +350,7 @@ diagnostic = os.environ["VARIANT"] == "b_worker_diagnostic"
 triton_attention = os.environ["VARIANT"] in {"prefill_triton", "prefill_deterministic"}
 expected = {
     "num_rollout": int(os.environ.get("NUM_ROLLOUT", "3")),
-    "debug_exit_after_rollout": 1,
+    "debug_exit_after_rollout": int(os.environ["DEBUG_EXIT_AFTER_ROLLOUT"]),
     "rollout_batch_size": 1 if diagnostic else 4,
     "n_samples_per_prompt": 1 if diagnostic else 2,
     "global_batch_size": 2 if diagnostic else 8,

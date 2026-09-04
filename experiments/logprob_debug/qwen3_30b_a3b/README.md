@@ -209,3 +209,11 @@ All ON aggregate mean absolute differences meet the requested `<0.01` target,
 including both reference floors. See `RESULTS.md` for complete provenance,
 failed-startup context, the step-by-step record, and the observation/inference/
 proven-cause distinction. The public blog draft remains unchanged.
+
+## Controlled tutorial
+
+The follow-up tutorial deliberately injects one fault at A-B, one at B-C, and
+one model-state synchronization fault. Its code, exact wrapper invocations,
+clean/fault/fixed tables, plots, and caveats are in
+[`tutorial/README.md`](tutorial/README.md) and
+[`tutorial/TUTORIAL_RESULTS.md`](tutorial/TUTORIAL_RESULTS.md).

@@ -322,6 +322,7 @@ async def test_debug_compare_records_repeats_without_replacing_decode_logprobs(m
         "response_token_ids": [20, 21],
         "decode_logprobs": [-1.0, -2.0],
         "prefill_logprobs_repeats": [[-1.1, -2.1], [-1.2, -2.2]],
+        "prefill_scoring_url": "http://localhost/generate",
     }
     assert calls == [
         "http://localhost/flush_cache",
@@ -401,3 +402,22 @@ def test_debug_compare_rejects_nonfinite_prefill_logprobs():
 
     with pytest.raises(ValueError, match="NaN or Inf"):
         prefill_logprobs._record_prefill_logprobs(args, sample, [float("nan")])
+
+
+def test_debug_compare_rejects_prefill_worker_change():
+    sample = Sample(
+        tokens=[10, 11, 20],
+        response_length=1,
+        rollout_log_probs=[-1.0],
+        status=Sample.Status.COMPLETED,
+    )
+    prefill_logprobs._initialize_logprob_debug(
+        sample,
+        prefill_scoring_url="http://worker-a/generate",
+    )
+
+    with pytest.raises(ValueError, match="prefill scoring worker changed"):
+        prefill_logprobs._initialize_logprob_debug(
+            sample,
+            prefill_scoring_url="http://worker-b/generate",
+        )

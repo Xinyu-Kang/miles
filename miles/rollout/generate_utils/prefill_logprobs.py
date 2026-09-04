@@ -32,7 +32,11 @@ def _validate_debug_logprobs(values: list[float], *, name: str, expected_length:
         raise ValueError(f"{name} contains NaN or Inf")
 
 
-def _initialize_logprob_debug(sample: Sample) -> None:
+def _initialize_logprob_debug(
+    sample: Sample,
+    *,
+    prefill_scoring_url: str | None = None,
+) -> None:
     response_token_ids = list(sample.tokens[-sample.response_length :])
     decode_logprobs = list(sample.rollout_log_probs or [])
     _validate_debug_logprobs(
@@ -47,12 +51,21 @@ def _initialize_logprob_debug(sample: Sample) -> None:
             "response_token_ids": response_token_ids,
             "decode_logprobs": decode_logprobs,
             "prefill_logprobs_repeats": [],
+            "prefill_scoring_url": prefill_scoring_url,
         }
         return
     if record.get("response_token_ids") != response_token_ids:
         raise ValueError("SGLang logprob debug response token IDs changed between prefill repeats")
     if record.get("decode_logprobs") != decode_logprobs:
         raise ValueError("SGLang generation-time rollout logprobs changed before prefill replay")
+    if prefill_scoring_url is not None:
+        recorded_url = record.get("prefill_scoring_url")
+        if recorded_url is None:
+            record["prefill_scoring_url"] = prefill_scoring_url
+        elif recorded_url != prefill_scoring_url:
+            raise ValueError(
+                f"SGLang prefill scoring worker changed: {recorded_url} != {prefill_scoring_url}"
+            )
 
 
 def _record_prefill_logprobs(args: Any, sample: Sample, prefill_logprobs: list[float]) -> None:
@@ -190,8 +203,8 @@ async def recompute_rollout_logprobs_via_prefill(
     if sample.status == Sample.Status.ABORTED:
         return
 
-    if _debug_compare_enabled(args) and "logprob_debug" not in sample.metadata:
-        _initialize_logprob_debug(sample)
+    if _debug_compare_enabled(args):
+        _initialize_logprob_debug(sample, prefill_scoring_url=url)
     payload = _build_prefill_scoring_payload(args, sample, sampling_params)
     output = await post(url, payload, headers=headers)
     prefill_logprobs = _extract_response_logprobs(sample, output["meta_info"])
@@ -216,7 +229,7 @@ async def recompute_samples_rollout_logprobs_via_prefill(
 
     if _debug_compare_enabled(args):
         for sample in samples_to_score:
-            _initialize_logprob_debug(sample)
+            _initialize_logprob_debug(sample, prefill_scoring_url=url)
 
     flush_url = url.rsplit("/", 1)[0] + "/flush_cache"
     num_repeats = (

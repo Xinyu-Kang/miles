@@ -378,6 +378,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--debug-skip-rollout-weight-update-at",
+                type=int,
+                default=None,
+                help=(
+                    "Debug-only tutorial hook: skip the actor-to-rollout weight update after exactly "
+                    "this rollout ID. Requires the explicit fault-injection environment guard."
+                ),
+            )
+            parser.add_argument(
                 "--debug-disable-optimizer",
                 action="store_true",
                 default=False,

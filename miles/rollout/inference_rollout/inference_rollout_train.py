@@ -175,10 +175,18 @@ async def generate_rollout_async(
     if f := load_function(args.rollout_all_samples_process_path):
         f(args, all_samples, data_source)
 
+    prefill_scoring_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    if getattr(args, "debug_compare_decode_prefill_logprobs", False):
+        worker_urls = sorted(await get_worker_urls(args))
+        if not worker_urls:
+            raise RuntimeError("Cannot pin debug prefill replay: SGLang router reports no workers")
+        prefill_scoring_url = f"{worker_urls[0].rstrip('/')}/generate"
+        logger.info("Debug prefill replay pinned to worker %s", prefill_scoring_url)
+
     await recompute_samples_rollout_logprobs_via_prefill(
         args,
         [sample for group in data for sample in group],
-        url=f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate",
+        url=prefill_scoring_url,
         sampling_params=state.sampling_params,
     )
 
