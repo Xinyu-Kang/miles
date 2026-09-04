@@ -12,6 +12,7 @@ from miles.utils.arguments import (
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
     _resolve_rollout_functions,
+    _validate_debug_logprob_args,
     _validate_rematerialize_param_from_master_weight,
     get_miles_extra_args_provider,
     miles_validate_args,
@@ -187,6 +188,81 @@ def test_recompute_logprobs_via_prefill_flag_is_parsed():
     args = parser.parse_args(["--recompute-logprobs-via-prefill"] + REQUIRED_ARGS)
 
     assert args.recompute_logprobs_via_prefill is True
+
+
+def test_debug_compare_logprobs_is_independent_of_true_on_policy():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(
+        [
+            "--debug-compare-decode-prefill-logprobs",
+            "--debug-prefill-logprob-repeats",
+            "2",
+            "--debug-trainer-logprob-repeats",
+            "2",
+            "--dump-details",
+            "/tmp/details",
+            *REQUIRED_ARGS,
+        ]
+    )
+
+    _validate_debug_logprob_args(args)
+
+    assert args.debug_compare_decode_prefill_logprobs is True
+    assert args.debug_prefill_logprob_repeats == 2
+    assert args.debug_trainer_logprob_repeats == 2
+    assert args.true_on_policy_mode is False
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"dump_details": None}, "requires --dump-details"),
+        ({"fully_async": True}, "does not support --fully-async"),
+        ({"debug_prefill_logprob_repeats": 0}, "must be at least 1"),
+        ({"debug_trainer_logprob_repeats": 0}, "must be at least 1"),
+        ({"debug_trainer_logprob_repeats": 3}, "supports at most 2"),
+    ],
+)
+def test_debug_compare_logprobs_validation(overrides, message):
+    values = {
+        "debug_compare_decode_prefill_logprobs": True,
+        "debug_prefill_logprob_repeats": 2,
+        "dump_details": "/tmp/details",
+        "fully_async": False,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_debug_logprob_args(SimpleNamespace(**values))
+
+
+def test_debug_prefill_repeats_requires_debug_compare():
+    args = SimpleNamespace(
+        debug_compare_decode_prefill_logprobs=False,
+        debug_prefill_logprob_repeats=2,
+    )
+
+    with pytest.raises(ValueError, match="requires --debug-compare"):
+        _validate_debug_logprob_args(args)
+
+
+def test_debug_trainer_repeats_requires_dump_details():
+    args = SimpleNamespace(
+        debug_compare_decode_prefill_logprobs=False,
+        debug_prefill_logprob_repeats=1,
+        debug_trainer_logprob_repeats=2,
+        dump_details=None,
+        fully_async=False,
+        train_backend="megatron",
+        debug_rollout_only=False,
+        skip_actor_forward_only=False,
+        use_rollout_logprobs=False,
+        get_mismatch_metrics=False,
+    )
+
+    with pytest.raises(ValueError, match="requires --dump-details"):
+        _validate_debug_logprob_args(args)
 
 
 def test_sglang_parallel_sizes_keep_server_args_destinations():

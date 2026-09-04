@@ -173,6 +173,46 @@ def test_save_model_does_not_manage_lifecycle(actor_module, monkeypatch):
     destroy_groups.assert_not_called()
 
 
+def test_debug_trainer_logprob_repeat_precedes_optimizer_train(actor_module, monkeypatch):
+    worker = _actor_reuse_worker(actor_module, debug_trainer_logprob_repeats=2)
+    _patch_actor_reuse_dependencies(actor_module, monkeypatch, num_microbatches=[1])
+    events = []
+
+    def score(*_args, store_prefix, **_kwargs):
+        events.append(store_prefix or "C0")
+        return {f"{store_prefix}log_probs": [store_prefix or "C0"]}
+
+    worker.compute_log_prob.side_effect = score
+
+    def run_train(*_args, **_kwargs):
+        events.append("optimizer_train")
+        return actor_module.TrainStepOutcome.DISCARDED_SHOULD_RETRY
+
+    actor_module.train.side_effect = run_train
+    rollout_data = {"num_rollouts": [1], "total_lengths": [1]}
+
+    worker.train_actor(7, rollout_data, witness_info=None, attempt=0)
+
+    assert events == ["C0", "debug_repeat_1_", "optimizer_train"]
+    assert rollout_data["log_probs"] == ["C0"]
+    assert rollout_data["debug_repeat_1_log_probs"] == ["debug_repeat_1_"]
+
+def test_default_trainer_forward_preserves_recorded_routing(actor_module, monkeypatch):
+    worker = _actor_reuse_worker(actor_module)
+    _patch_actor_reuse_dependencies(actor_module, monkeypatch, num_microbatches=[1])
+    manager = Mock()
+    manager.enabled = True
+    manager.name = "routing"
+    monkeypatch.setattr(actor_module, "all_replay_managers", [manager])
+    rollout_data = {"num_rollouts": [1], "total_lengths": [1]}
+
+    worker.train_actor(7, rollout_data, witness_info=None, attempt=0)
+
+    assert manager.stage == "record"
+    manager.clear_all_forward.assert_not_called()
+
+
+
 @pytest.mark.parametrize("asleep", [False, True])
 def test_update_weights_only_uses_temporary_process_groups_when_asleep(actor_module, monkeypatch, asleep):
     worker = object.__new__(actor_module.MegatronTrainRayActor)

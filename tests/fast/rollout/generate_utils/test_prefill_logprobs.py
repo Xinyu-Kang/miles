@@ -266,3 +266,138 @@ async def test_recompute_samples_batches_by_logprob_start_len(monkeypatch):
     assert calls[1][1]["input_ids"] == [[10, 11, 20], [10, 11, 22]]
     assert calls[3][1]["logprob_start_len"] == 2
     assert calls[3][1]["input_ids"] == [[10, 11, 12, 21]]
+
+
+@pytest.mark.asyncio
+async def test_debug_compare_records_repeats_without_replacing_decode_logprobs(monkeypatch):
+    samples = [
+        Sample(
+            tokens=[10, 11, 20, 21],
+            response_length=2,
+            rollout_log_probs=[-1.0, -2.0],
+            status=Sample.Status.COMPLETED,
+        )
+    ]
+    args = SimpleNamespace(
+        recompute_logprobs_via_prefill=False,
+        debug_compare_decode_prefill_logprobs=True,
+        debug_prefill_logprob_repeats=2,
+        sglang_enable_lora=False,
+        sglang_router_policy="round_robin",
+    )
+    calls = []
+    generate_calls = 0
+
+    async def fake_post(url, payload, headers=None):
+        nonlocal generate_calls
+        calls.append(url)
+        if url.endswith("/flush_cache"):
+            return {}
+        logprobs = [[-1.1, -2.1], [-1.2, -2.2]][generate_calls]
+        generate_calls += 1
+        return [
+            {
+                "meta_info": {
+                    "input_token_logprobs": [
+                        (None, 11),
+                        (logprobs[0], 20),
+                        (logprobs[1], 21),
+                    ]
+                }
+            }
+        ]
+
+    monkeypatch.setattr(prefill_logprobs, "post", fake_post)
+
+    await prefill_logprobs.recompute_samples_rollout_logprobs_via_prefill(
+        args,
+        samples,
+        url="http://localhost/generate",
+        sampling_params={},
+    )
+
+    sample = samples[0]
+    assert sample.rollout_log_probs == [-1.0, -2.0]
+    assert sample.metadata["logprob_debug"] == {
+        "response_token_ids": [20, 21],
+        "decode_logprobs": [-1.0, -2.0],
+        "prefill_logprobs_repeats": [[-1.1, -2.1], [-1.2, -2.2]],
+    }
+    assert calls == [
+        "http://localhost/flush_cache",
+        "http://localhost/generate",
+        "http://localhost/flush_cache",
+        "http://localhost/generate",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_debug_compare_checks_exact_prefill_tokens(monkeypatch):
+    sample = Sample(
+        tokens=[10, 11, 20],
+        response_length=1,
+        rollout_log_probs=[-1.0],
+        status=Sample.Status.COMPLETED,
+    )
+    args = SimpleNamespace(
+        recompute_logprobs_via_prefill=False,
+        debug_compare_decode_prefill_logprobs=True,
+        debug_prefill_logprob_repeats=1,
+        sglang_enable_lora=False,
+        sglang_router_policy="round_robin",
+    )
+
+    async def fake_post(url, payload, headers=None):
+        if url.endswith("/flush_cache"):
+            return {}
+        return [{"meta_info": {"input_token_logprobs": [(None, 11), (-1.1, 999)]}}]
+
+    monkeypatch.setattr(prefill_logprobs, "post", fake_post)
+
+    with pytest.raises(ValueError, match="token alignment mismatch"):
+        await prefill_logprobs.recompute_samples_rollout_logprobs_via_prefill(
+            args,
+            [sample],
+            url="http://localhost/generate",
+            sampling_params={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_debug_compare_rejects_nonfinite_decode_logprobs():
+    sample = Sample(
+        tokens=[10, 11, 20],
+        response_length=1,
+        rollout_log_probs=[float("inf")],
+        status=Sample.Status.COMPLETED,
+    )
+    args = SimpleNamespace(
+        recompute_logprobs_via_prefill=False,
+        debug_compare_decode_prefill_logprobs=True,
+        debug_prefill_logprob_repeats=1,
+    )
+
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        await prefill_logprobs.recompute_samples_rollout_logprobs_via_prefill(
+            args,
+            [sample],
+            url="http://localhost/generate",
+            sampling_params={},
+        )
+
+
+def test_debug_compare_rejects_nonfinite_prefill_logprobs():
+    sample = Sample(
+        tokens=[10, 11, 20],
+        response_length=1,
+        rollout_log_probs=[-1.0],
+        status=Sample.Status.COMPLETED,
+    )
+    args = SimpleNamespace(
+        recompute_logprobs_via_prefill=False,
+        debug_compare_decode_prefill_logprobs=True,
+    )
+    prefill_logprobs._initialize_logprob_debug(sample)
+
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        prefill_logprobs._record_prefill_logprobs(args, sample, [float("nan")])

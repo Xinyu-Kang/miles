@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
@@ -10,6 +11,66 @@ from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.multi_lora import slot_lora_name
 from miles.utils.processing_utils import encode_image_for_rollout_engine
 from miles.utils.types import Sample
+
+
+def _debug_compare_enabled(args: Any) -> bool:
+    return bool(getattr(args, "debug_compare_decode_prefill_logprobs", False))
+
+
+def _prefill_scoring_enabled(args: Any) -> bool:
+    return bool(getattr(args, "recompute_logprobs_via_prefill", False) or _debug_compare_enabled(args))
+
+
+def _validate_debug_logprobs(values: list[float], *, name: str, expected_length: int) -> None:
+    if len(values) != expected_length:
+        raise ValueError(f"{name} length mismatch: expected {expected_length}, got {len(values)}")
+    try:
+        finite = all(math.isfinite(float(value)) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} contains a non-numeric value") from exc
+    if not finite:
+        raise ValueError(f"{name} contains NaN or Inf")
+
+
+def _initialize_logprob_debug(sample: Sample) -> None:
+    response_token_ids = list(sample.tokens[-sample.response_length :])
+    decode_logprobs = list(sample.rollout_log_probs or [])
+    _validate_debug_logprobs(
+        decode_logprobs,
+        name="SGLang generation-time rollout logprobs",
+        expected_length=sample.response_length,
+    )
+
+    record = sample.metadata.get("logprob_debug")
+    if record is None:
+        sample.metadata["logprob_debug"] = {
+            "response_token_ids": response_token_ids,
+            "decode_logprobs": decode_logprobs,
+            "prefill_logprobs_repeats": [],
+        }
+        return
+    if record.get("response_token_ids") != response_token_ids:
+        raise ValueError("SGLang logprob debug response token IDs changed between prefill repeats")
+    if record.get("decode_logprobs") != decode_logprobs:
+        raise ValueError("SGLang generation-time rollout logprobs changed before prefill replay")
+
+
+def _record_prefill_logprobs(args: Any, sample: Sample, prefill_logprobs: list[float]) -> None:
+    if _debug_compare_enabled(args):
+        _validate_debug_logprobs(
+            prefill_logprobs,
+            name="SGLang prefill replay logprobs",
+            expected_length=sample.response_length,
+        )
+        record = sample.metadata["logprob_debug"]
+        response_token_ids = list(sample.tokens[-sample.response_length :])
+        if record["response_token_ids"] != response_token_ids:
+            raise ValueError("SGLang logprob debug response token IDs changed during prefill replay")
+        record["prefill_logprobs_repeats"].append(list(prefill_logprobs))
+
+    if getattr(args, "recompute_logprobs_via_prefill", False):
+        sample.rollout_log_probs = list(prefill_logprobs)
+        sample.metadata["rollout_log_probs_source"] = "sglang_prefill_recompute"
 
 
 def _lora_path_for_sample(args: Any, sample: Sample) -> str | None:
@@ -120,18 +181,21 @@ async def recompute_rollout_logprobs_via_prefill(
     sampling_params: Mapping[str, Any],
     headers: Mapping[str, str] | None = None,
 ) -> None:
-    if not getattr(args, "recompute_logprobs_via_prefill", False):
+    if not _prefill_scoring_enabled(args):
         return
     if sample.response_length == 0:
-        sample.rollout_log_probs = []
+        if getattr(args, "recompute_logprobs_via_prefill", False):
+            sample.rollout_log_probs = []
         return
     if sample.status == Sample.Status.ABORTED:
         return
 
+    if _debug_compare_enabled(args) and "logprob_debug" not in sample.metadata:
+        _initialize_logprob_debug(sample)
     payload = _build_prefill_scoring_payload(args, sample, sampling_params)
     output = await post(url, payload, headers=headers)
-    sample.rollout_log_probs = _extract_response_logprobs(sample, output["meta_info"])
-    sample.metadata["rollout_log_probs_source"] = "sglang_prefill_recompute"
+    prefill_logprobs = _extract_response_logprobs(sample, output["meta_info"])
+    _record_prefill_logprobs(args, sample, prefill_logprobs)
 
 
 async def recompute_samples_rollout_logprobs_via_prefill(
@@ -141,7 +205,7 @@ async def recompute_samples_rollout_logprobs_via_prefill(
     url: str,
     sampling_params: Mapping[str, Any],
 ) -> None:
-    if not getattr(args, "recompute_logprobs_via_prefill", False):
+    if not _prefill_scoring_enabled(args):
         return
 
     samples_to_score = [
@@ -150,7 +214,14 @@ async def recompute_samples_rollout_logprobs_via_prefill(
     if not samples_to_score:
         return
 
+    if _debug_compare_enabled(args):
+        for sample in samples_to_score:
+            _initialize_logprob_debug(sample)
+
     flush_url = url.rsplit("/", 1)[0] + "/flush_cache"
+    num_repeats = (
+        getattr(args, "debug_prefill_logprob_repeats", 1) if _debug_compare_enabled(args) else 1
+    )
 
     if _can_batch_prefill_score(args, samples_to_score):
         # A batch must share one logprob_start_len and one lora_path, so group by both.
@@ -159,32 +230,34 @@ async def recompute_samples_rollout_logprobs_via_prefill(
             prompt_len = len(sample.tokens) - sample.response_length
             samples_by_batch_key[(prompt_len - 1, _lora_path_for_sample(args, sample))].append(sample)
 
-        for batch_samples in samples_by_batch_key.values():
-            # SGLang can serve scoring requests from radix/KV cache. Flush before
-            # each scoring group so every group uses the same clean-prefill path.
-            await post(flush_url, {})
-            payload = _build_batch_prefill_scoring_payload(args, batch_samples, sampling_params)
-            outputs = await post(url, payload)
-            if not isinstance(outputs, list):
-                raise ValueError(f"SGLang batch prefill scoring returned {type(outputs).__name__}, expected list")
-            if len(outputs) != len(batch_samples):
-                raise ValueError(
-                    "SGLang batch prefill scoring output count mismatch: "
-                    f"expected {len(batch_samples)}, got {len(outputs)}"
-                )
-            for sample, output in zip(batch_samples, outputs, strict=True):
-                sample.rollout_log_probs = _extract_response_logprobs(sample, output["meta_info"])
-                sample.metadata["rollout_log_probs_source"] = "sglang_prefill_recompute"
+        for _ in range(num_repeats):
+            for batch_samples in samples_by_batch_key.values():
+                # SGLang can serve scoring requests from radix/KV cache. Flush before
+                # each scoring group so every group uses the same clean-prefill path.
+                await post(flush_url, {})
+                payload = _build_batch_prefill_scoring_payload(args, batch_samples, sampling_params)
+                outputs = await post(url, payload)
+                if not isinstance(outputs, list):
+                    raise ValueError(f"SGLang batch prefill scoring returned {type(outputs).__name__}, expected list")
+                if len(outputs) != len(batch_samples):
+                    raise ValueError(
+                        "SGLang batch prefill scoring output count mismatch: "
+                        f"expected {len(batch_samples)}, got {len(outputs)}"
+                    )
+                for sample, output in zip(batch_samples, outputs, strict=True):
+                    prefill_logprobs = _extract_response_logprobs(sample, output["meta_info"])
+                    _record_prefill_logprobs(args, sample, prefill_logprobs)
         return
 
-    for sample in samples_to_score:
-        headers = compute_routing_headers(args, sample)
+    for _ in range(num_repeats):
+        for sample in samples_to_score:
+            headers = compute_routing_headers(args, sample)
 
-        await post(flush_url, {}, headers=headers)
-        await recompute_rollout_logprobs_via_prefill(
-            args,
-            sample,
-            url=url,
-            sampling_params=sampling_params,
-            headers=headers,
-        )
+            await post(flush_url, {}, headers=headers)
+            await recompute_rollout_logprobs_via_prefill(
+                args,
+                sample,
+                url=url,
+                sampling_params=sampling_params,
+                headers=headers,
+            )

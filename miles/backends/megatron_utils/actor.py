@@ -564,8 +564,24 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="",
                         )
                     )
+                    trainer_logprob_repeats = getattr(self.args, "debug_trainer_logprob_repeats", 1)
+                    for repeat in range(1, trainer_logprob_repeats):
+                        for m in all_replay_managers:
+                            if m.enabled:
+                                m.stage = "replay_forward"
+                                m.clear_all_forward()
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator,
+                                num_microbatches,
+                                rollout_id=rollout_id,
+                                store_prefix=f"debug_repeat_{repeat}_",
+                            )
+                        )
                     for m in all_replay_managers:
-                        if self._use_rollout_replay(m):
+                        if self._use_rollout_replay(m) or (
+                            trainer_logprob_repeats > 1 and m.enabled
+                        ):
                             m.clear_all_forward()
 
                 if self.args.use_critic:

@@ -336,6 +336,27 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--debug-compare-decode-prefill-logprobs",
+                action="store_true",
+                default=False,
+                help=(
+                    "Debug only: preserve generation-time rollout logprobs, recompute the same response "
+                    "through SGLang prefill, and dump both without changing which logprobs training consumes."
+                ),
+            )
+            parser.add_argument(
+                "--debug-prefill-logprob-repeats",
+                type=int,
+                default=1,
+                help="Number of clean-cache SGLang prefill replays to record in debug mode.",
+            )
+            parser.add_argument(
+                "--debug-trainer-logprob-repeats",
+                type=int,
+                default=1,
+                help="Number of frozen-batch Megatron logprob forwards to record before optimizer update.",
+            )
+            parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
                 default="{}",
@@ -2881,6 +2902,41 @@ def _validate_rematerialize_param_from_master_weight(args):
         args.check_rematerialize_param_from_master_weight = True
 
 
+def _validate_debug_logprob_args(args) -> None:
+    if args.debug_prefill_logprob_repeats < 1:
+        raise ValueError("--debug-prefill-logprob-repeats must be at least 1")
+    if args.debug_compare_decode_prefill_logprobs:
+        if args.dump_details is None:
+            raise ValueError("--debug-compare-decode-prefill-logprobs requires --dump-details")
+        if args.fully_async:
+            raise ValueError("--debug-compare-decode-prefill-logprobs does not support --fully-async")
+    elif args.debug_prefill_logprob_repeats != 1:
+        raise ValueError("--debug-prefill-logprob-repeats requires --debug-compare-decode-prefill-logprobs")
+
+    trainer_repeats = getattr(args, "debug_trainer_logprob_repeats", 1)
+    if trainer_repeats < 1:
+        raise ValueError("--debug-trainer-logprob-repeats must be at least 1")
+    if trainer_repeats > 2:
+        raise ValueError("--debug-trainer-logprob-repeats currently supports at most 2 forwards")
+    if trainer_repeats == 1:
+        return
+    if args.dump_details is None:
+        raise ValueError("--debug-trainer-logprob-repeats requires --dump-details")
+    if args.fully_async:
+        raise ValueError("--debug-trainer-logprob-repeats does not support --fully-async")
+    if args.train_backend != "megatron":
+        raise ValueError("--debug-trainer-logprob-repeats currently requires --train-backend megatron")
+    if args.debug_rollout_only:
+        raise ValueError("--debug-trainer-logprob-repeats is incompatible with --debug-rollout-only")
+    if args.skip_actor_forward_only:
+        raise ValueError("--debug-trainer-logprob-repeats is incompatible with --skip-actor-forward-only")
+    if args.use_rollout_logprobs and not args.get_mismatch_metrics:
+        raise ValueError(
+            "--debug-trainer-logprob-repeats requires the Megatron old-policy forward; "
+            "use --get-mismatch-metrics with --use-rollout-logprobs"
+        )
+
+
 def miles_validate_args(args):
     validate_dashboard_args(args)
 
@@ -2917,6 +2973,8 @@ def miles_validate_args(args):
 
     if args.recompute_logprobs_via_prefill:
         assert args.true_on_policy_mode, "--recompute-logprobs-via-prefill requires --true-on-policy-mode"
+
+    _validate_debug_logprob_args(args)
 
     if args.use_session_server not in (False, True, "v1", "v2"):
         raise ValueError(

@@ -139,6 +139,7 @@ class TrainRow:
     reward: float
     loss_mask: torch.Tensor
     log_probs: torch.Tensor | None  # absent when the run does not dump them
+    debug_repeat_1_log_probs: torch.Tensor | None
     rollout_log_probs: torch.Tensor | None
     ref_log_probs: torch.Tensor | None
     entropy: torch.Tensor | None
@@ -166,6 +167,7 @@ class TrainRow:
             reward=columns["rewards"][row],
             loss_mask=columns["loss_masks"][row],
             log_probs=optional("log_probs"),
+            debug_repeat_1_log_probs=optional("debug_repeat_1_log_probs"),
             rollout_log_probs=optional("rollout_log_probs"),
             ref_log_probs=optional("ref_log_probs"),
             entropy=optional("entropy"),
@@ -181,6 +183,7 @@ class TrainRow:
 # Per-token fields stored as the rank's cp slice; everything else is full-length.
 _CP_SHARDED_FIELDS = (
     "log_probs",
+    "debug_repeat_1_log_probs",
     "rollout_log_probs",
     "ref_log_probs",
     "entropy",
